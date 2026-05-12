@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use orca_whirlpools_client::{get_position_address, Position, Whirlpool};
+use orca_whirlpools_client::{get_position_address, Position, Whirlpool, WhirlpoolDeployment};
 use solana_keypair::Signer;
 use solana_program_pack::Pack;
 use solana_pubkey::Pubkey;
@@ -13,7 +13,10 @@ use crate::{
     harvest_position_instructions, increase_liquidity_instructions,
     open_full_range_position_instructions, swap_instructions,
     tests::{setup_ata_with_amount, setup_mint_with_decimals, RpcContext},
-    DecreaseLiquidityParam, IncreaseLiquidityParam, SwapQuote, SwapType, SPLASH_POOL_TICK_SPACING,
+    ClosePositionConfig, CreateConcentratedLiquidityPoolConfig, CreateSplashPoolConfig,
+    DecreaseLiquidityConfig, DecreaseLiquidityParam, HarvestPositionConfig,
+    IncreaseLiquidityConfig, IncreaseLiquidityParam, OpenFullRangePositionConfig, SwapConfig,
+    SwapQuote, SwapType, SPLASH_POOL_TICK_SPACING,
 };
 
 struct TestContext {
@@ -22,10 +25,11 @@ struct TestContext {
     mint_b: Pubkey,
     ata_a: Pubkey,
     ata_b: Pubkey,
+    whirlpool_deployment: WhirlpoolDeployment,
 }
 
 impl TestContext {
-    pub async fn new() -> Result<Self, Box<dyn Error>> {
+    pub async fn new(whirlpool_deployment: WhirlpoolDeployment) -> Result<Self, Box<dyn Error>> {
         let ctx = RpcContext::new();
         let mint_a = setup_mint_with_decimals(&ctx, 9).await?;
         let mint_b = setup_mint_with_decimals(&ctx, 9).await?;
@@ -37,6 +41,7 @@ impl TestContext {
             mint_b,
             ata_a,
             ata_b,
+            whirlpool_deployment,
         })
     }
 
@@ -45,8 +50,11 @@ impl TestContext {
             &self.ctx.rpc,
             self.mint_a,
             self.mint_b,
-            None,
-            Some(self.ctx.signer.pubkey()),
+            CreateSplashPoolConfig {
+                initial_price: None,
+                funder: Some(self.ctx.signer.pubkey()),
+                whirlpool_deployment: Some(self.whirlpool_deployment),
+            },
         )
         .await?;
         self.ctx
@@ -71,8 +79,11 @@ impl TestContext {
             self.mint_a,
             self.mint_b,
             128,
-            None,
-            Some(self.ctx.signer.pubkey()),
+            CreateConcentratedLiquidityPoolConfig {
+                initial_price: None,
+                funder: Some(self.ctx.signer.pubkey()),
+                whirlpool_deployment: Some(self.whirlpool_deployment),
+            },
         )
         .await?;
         self.ctx
@@ -108,8 +119,11 @@ impl TestContext {
             &self.ctx.rpc,
             pool,
             param,
-            None,
-            Some(self.ctx.signer.pubkey()),
+            OpenFullRangePositionConfig {
+                slippage_tolerance_bps: None,
+                funder: Some(self.ctx.signer.pubkey()),
+                whirlpool_deployment: Some(self.whirlpool_deployment),
+            },
         )
         .await?;
 
@@ -120,7 +134,11 @@ impl TestContext {
             )
             .await?;
 
-        let position_address = get_position_address(&position.position_mint)?.0;
+        let position_address = get_position_address(
+            &position.position_mint,
+            Some(self.whirlpool_deployment.id()),
+        )?
+        .0;
         let infos_after = &self
             .ctx
             .rpc
@@ -142,7 +160,8 @@ impl TestContext {
     }
 
     pub async fn increase_liquidity(&self, position_mint: Pubkey) -> Result<(), Box<dyn Error>> {
-        let position_address = get_position_address(&position_mint)?.0;
+        let position_address =
+            get_position_address(&position_mint, Some(self.whirlpool_deployment.id()))?.0;
         let infos_before = &self
             .ctx
             .rpc
@@ -160,8 +179,11 @@ impl TestContext {
             &self.ctx.rpc,
             position_mint,
             param,
-            None,
-            Some(self.ctx.signer.pubkey()),
+            IncreaseLiquidityConfig {
+                slippage_tolerance_bps: None,
+                authority: Some(self.ctx.signer.pubkey()),
+                whirlpool_deployment: Some(self.whirlpool_deployment),
+            },
         )
         .await?;
         self.ctx
@@ -189,7 +211,8 @@ impl TestContext {
     }
 
     pub async fn decrease_liquidity(&self, position_mint: Pubkey) -> Result<(), Box<dyn Error>> {
-        let position_address = get_position_address(&position_mint)?.0;
+        let position_address =
+            get_position_address(&position_mint, Some(self.whirlpool_deployment.id()))?.0;
         let infos_before = &self
             .ctx
             .rpc
@@ -203,8 +226,11 @@ impl TestContext {
             &self.ctx.rpc,
             position_mint,
             DecreaseLiquidityParam::Liquidity(10000),
-            None,
-            Some(self.ctx.signer.pubkey()),
+            DecreaseLiquidityConfig {
+                slippage_tolerance_bps: None,
+                authority: Some(self.ctx.signer.pubkey()),
+                whirlpool_deployment: Some(self.whirlpool_deployment),
+            },
         )
         .await?;
         self.ctx
@@ -250,7 +276,10 @@ impl TestContext {
         let harvest_position = harvest_position_instructions(
             &self.ctx.rpc,
             position_mint,
-            Some(self.ctx.signer.pubkey()),
+            HarvestPositionConfig {
+                authority: Some(self.ctx.signer.pubkey()),
+                whirlpool_deployment: Some(self.whirlpool_deployment),
+            },
         )
         .await?;
         self.ctx
@@ -291,8 +320,11 @@ impl TestContext {
         let close_position = close_position_instructions(
             &self.ctx.rpc,
             position_mint,
-            None,
-            Some(self.ctx.signer.pubkey()),
+            ClosePositionConfig {
+                slippage_tolerance_bps: None,
+                authority: Some(self.ctx.signer.pubkey()),
+                whirlpool_deployment: Some(self.whirlpool_deployment),
+            },
         )
         .await?;
         self.ctx
@@ -302,7 +334,8 @@ impl TestContext {
             )
             .await?;
 
-        let position_address = get_position_address(&position_mint)?.0;
+        let position_address =
+            get_position_address(&position_mint, Some(self.whirlpool_deployment.id()))?.0;
         let after_infos = &self
             .ctx
             .rpc
@@ -338,8 +371,11 @@ impl TestContext {
             100000,
             self.mint_a,
             SwapType::ExactIn,
-            None,
-            Some(self.ctx.signer.pubkey()),
+            SwapConfig {
+                slippage_tolerance_bps: None,
+                signer: Some(self.ctx.signer.pubkey()),
+                whirlpool_deployment: Some(self.whirlpool_deployment),
+            },
         )
         .await?;
         self.ctx
@@ -385,8 +421,11 @@ impl TestContext {
             100000,
             self.mint_a,
             SwapType::ExactOut,
-            None,
-            Some(self.ctx.signer.pubkey()),
+            SwapConfig {
+                slippage_tolerance_bps: None,
+                signer: Some(self.ctx.signer.pubkey()),
+                whirlpool_deployment: Some(self.whirlpool_deployment),
+            },
         )
         .await?;
         self.ctx
@@ -435,8 +474,11 @@ impl TestContext {
             100,
             self.mint_b,
             SwapType::ExactIn,
-            None,
-            Some(self.ctx.signer.pubkey()),
+            SwapConfig {
+                slippage_tolerance_bps: None,
+                signer: Some(self.ctx.signer.pubkey()),
+                whirlpool_deployment: Some(self.whirlpool_deployment),
+            },
         )
         .await?;
         self.ctx
@@ -482,8 +524,11 @@ impl TestContext {
             100,
             self.mint_b,
             SwapType::ExactOut,
-            None,
-            Some(self.ctx.signer.pubkey()),
+            SwapConfig {
+                slippage_tolerance_bps: None,
+                signer: Some(self.ctx.signer.pubkey()),
+                whirlpool_deployment: Some(self.whirlpool_deployment),
+            },
         )
         .await?;
         self.ctx
@@ -517,9 +562,12 @@ impl TestContext {
     }
 }
 
+#[rstest::rstest]
+#[case(WhirlpoolDeployment::mainnet())]
+#[case(WhirlpoolDeployment::mainnet_immutable())]
 #[tokio::test]
-async fn test_splash_pool() {
-    let ctx = TestContext::new().await.unwrap();
+async fn test_splash_pool(#[case] whirlpool_deployment: WhirlpoolDeployment) {
+    let ctx = TestContext::new(whirlpool_deployment).await.unwrap();
     let pool = ctx.init_splash_pool().await.unwrap();
     let position_mint = ctx.open_position(pool).await.unwrap();
     Box::pin(ctx.swap_a_exact_in(pool)).await.unwrap();
@@ -536,9 +584,12 @@ async fn test_splash_pool() {
     Box::pin(ctx.close_position(position_mint)).await.unwrap();
 }
 
+#[rstest::rstest]
+#[case(WhirlpoolDeployment::mainnet())]
+#[case(WhirlpoolDeployment::mainnet_immutable())]
 #[tokio::test]
-async fn test_concentrated_liquidity_pool() {
-    let ctx = TestContext::new().await.unwrap();
+async fn test_concentrated_liquidity_pool(#[case] whirlpool_deployment: WhirlpoolDeployment) {
+    let ctx = TestContext::new(whirlpool_deployment).await.unwrap();
     let pool = ctx.init_concentrated_liquidity_pool().await.unwrap();
     let position_mint = ctx.open_position(pool).await.unwrap();
     Box::pin(ctx.swap_a_exact_in(pool)).await.unwrap();

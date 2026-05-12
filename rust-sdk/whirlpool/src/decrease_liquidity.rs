@@ -1,5 +1,6 @@
 use orca_whirlpools_client::{
     get_position_address, get_tick_array_address, FixedTickArray, Position, TickArray, Whirlpool,
+    WhirlpoolDeployment,
 };
 use orca_whirlpools_client::{
     ClosePosition, ClosePositionWithTokenExtensions, CollectFeesV2, CollectFeesV2InstructionArgs,
@@ -60,6 +61,17 @@ pub struct DecreaseLiquidityInstruction {
     pub additional_signers: Vec<Keypair>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DecreaseLiquidityConfig {
+    /// An optional slippage tolerance in basis points. Defaults to the global slippage tolerance if not provided.
+    pub slippage_tolerance_bps: Option<u16>,
+    /// An optional public key of the account authorizing the liquidity removal. Defaults to the global funder if not provided.
+    pub authority: Option<Pubkey>,
+    /// The Whirlpool program and config account to target.
+    /// Uses [`WhirlpoolDeployment::default`] when `None`.
+    pub whirlpool_deployment: Option<WhirlpoolDeployment>,
+}
+
 /// Generates instructions to decrease liquidity from an existing position.
 ///
 /// This function computes the necessary quote and creates Solana instructions to reduce liquidity
@@ -70,8 +82,7 @@ pub struct DecreaseLiquidityInstruction {
 /// * `rpc` - A reference to a Solana RPC client for fetching necessary accounts and pool data.
 /// * `position_mint_address` - The public key of the NFT mint address representing the pool position.
 /// * `param` - A variant of `DecreaseLiquidityParam` specifying the liquidity reduction method (by Token A, Token B, or liquidity amount).
-/// * `slippage_tolerance_bps` - An optional slippage tolerance in basis points. Defaults to the global slippage tolerance if not provided.
-/// * `authority` - An optional public key of the account authorizing the liquidity removal. Defaults to the global funder if not provided.
+/// * `config` - The parameters to build the deacrease liquidity instruction
 ///
 /// # Returns
 ///
@@ -92,7 +103,7 @@ pub struct DecreaseLiquidityInstruction {
 ///
 /// ```rust
 /// use orca_whirlpools::{
-///     decrease_liquidity_instructions, set_whirlpools_config_address, DecreaseLiquidityParam, WhirlpoolsConfigInput
+///     decrease_liquidity_instructions, DecreaseLiquidityConfig, DecreaseLiquidityParam, WhirlpoolDeployment
 /// };
 /// use solana_client::nonblocking::rpc_client::RpcClient;
 /// use solana_pubkey::Pubkey;
@@ -101,17 +112,20 @@ pub struct DecreaseLiquidityInstruction {
 ///
 /// #[tokio::main]
 /// async fn main() {
-///     set_whirlpools_config_address(WhirlpoolsConfigInput::SolanaDevnet).unwrap();
 ///     let rpc = RpcClient::new("https://api.devnet.solana.com".to_string());
 ///     let wallet = load_wallet();
 ///     let position_mint_address = Pubkey::from_str("HqoV7Qv27REUtmd9UKSJGGmCRNx3531t33bDG1BUfo9K").unwrap();
 ///     let param = DecreaseLiquidityParam::TokenA(1_000_000);
+///     let config = DecreaseLiquidityConfig {
+///         slippage_tolerance_bps: Some(100),
+///         authority: Some(wallet.pubkey()),
+///         whirlpool_deployment: Some(WhirlpoolDeployment::devnet()),
+///     };
 ///     let result = decrease_liquidity_instructions(
 ///         &rpc,
 ///         position_mint_address,
 ///         param,
-///         Some(100),
-///         Some(wallet.pubkey()),
+///         config
 ///     )
 ///     .await.unwrap();
 ///     println!("Liquidity Increase Quote: {:?}", result.quote);
@@ -122,17 +136,23 @@ pub async fn decrease_liquidity_instructions(
     rpc: &RpcClient,
     position_mint_address: Pubkey,
     param: DecreaseLiquidityParam,
-    slippage_tolerance_bps: Option<u16>,
-    authority: Option<Pubkey>,
+    config: DecreaseLiquidityConfig,
 ) -> Result<DecreaseLiquidityInstruction, Box<dyn Error>> {
+    let DecreaseLiquidityConfig {
+        slippage_tolerance_bps,
+        authority,
+        whirlpool_deployment,
+    } = config;
     let slippage_tolerance_bps =
         slippage_tolerance_bps.unwrap_or(*SLIPPAGE_TOLERANCE_BPS.try_lock()?);
     let authority = authority.unwrap_or(*FUNDER.try_lock()?);
+    let whirlpool_deployment = whirlpool_deployment.unwrap_or_default();
     if authority == Pubkey::default() {
         return Err("Authority must be provided".into());
     }
 
-    let position_address = get_position_address(&position_mint_address)?.0;
+    let position_address =
+        get_position_address(&position_mint_address, Some(whirlpool_deployment.id()))?.0;
     let position_info = rpc.get_account(&position_address).await?;
     let position = Position::from_bytes(&position_info.data)?;
 
@@ -199,10 +219,18 @@ pub async fn decrease_liquidity_instructions(
         &position_mint_address,
         &position_mint_info.owner,
     );
-    let lower_tick_array_address =
-        get_tick_array_address(&position.whirlpool, lower_tick_array_start_index)?.0;
-    let upper_tick_array_address =
-        get_tick_array_address(&position.whirlpool, upper_tick_array_start_index)?.0;
+    let lower_tick_array_address = get_tick_array_address(
+        &position.whirlpool,
+        lower_tick_array_start_index,
+        Some(whirlpool_deployment.id()),
+    )?
+    .0;
+    let upper_tick_array_address = get_tick_array_address(
+        &position.whirlpool,
+        upper_tick_array_start_index,
+        Some(whirlpool_deployment.id()),
+    )?
+    .0;
 
     let token_accounts = prepare_token_accounts_instructions(
         rpc,
@@ -225,31 +253,33 @@ pub async fn decrease_liquidity_instructions(
         .get(&pool.token_mint_b)
         .ok_or("Token B owner account not found")?;
 
-    instructions.push(
-        DecreaseLiquidityV2 {
-            whirlpool: position.whirlpool,
-            token_program_a: mint_a_info.owner,
-            token_program_b: mint_b_info.owner,
-            memo_program: spl_memo_interface::v3::ID,
-            position_authority: authority,
-            position: position_address,
-            position_token_account: position_token_account_address,
-            token_mint_a: pool.token_mint_a,
-            token_mint_b: pool.token_mint_b,
-            token_owner_account_a: *token_owner_account_a,
-            token_owner_account_b: *token_owner_account_b,
-            token_vault_a: pool.token_vault_a,
-            token_vault_b: pool.token_vault_b,
-            tick_array_lower: lower_tick_array_address,
-            tick_array_upper: upper_tick_array_address,
-        }
-        .instruction(DecreaseLiquidityV2InstructionArgs {
-            liquidity_amount: quote.liquidity_delta,
-            token_min_a: quote.token_min_a,
-            token_min_b: quote.token_min_b,
-            remaining_accounts_info: None,
-        }),
-    );
+    let mut decrease_liquidity_v2_ix = DecreaseLiquidityV2 {
+        whirlpool: position.whirlpool,
+        token_program_a: mint_a_info.owner,
+        token_program_b: mint_b_info.owner,
+        memo_program: spl_memo_interface::v3::ID,
+        position_authority: authority,
+        position: position_address,
+        position_token_account: position_token_account_address,
+        token_mint_a: pool.token_mint_a,
+        token_mint_b: pool.token_mint_b,
+        token_owner_account_a: *token_owner_account_a,
+        token_owner_account_b: *token_owner_account_b,
+        token_vault_a: pool.token_vault_a,
+        token_vault_b: pool.token_vault_b,
+        tick_array_lower: lower_tick_array_address,
+        tick_array_upper: upper_tick_array_address,
+    }
+    .instruction(DecreaseLiquidityV2InstructionArgs {
+        liquidity_amount: quote.liquidity_delta,
+        token_min_a: quote.token_min_a,
+        token_min_b: quote.token_min_b,
+        remaining_accounts_info: None,
+    });
+
+    decrease_liquidity_v2_ix.program_id = whirlpool_deployment.id();
+
+    instructions.push(decrease_liquidity_v2_ix);
 
     instructions.extend(token_accounts.cleanup_instructions);
 
@@ -286,6 +316,17 @@ pub struct ClosePositionInstruction {
     pub rewards_quote: CollectRewardsQuote,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ClosePositionConfig {
+    /// An optional slippage tolerance in basis points. Defaults to the global slippage tolerance if not provided.
+    pub slippage_tolerance_bps: Option<u16>,
+    /// An optional public key of the account authorizing the transaction. Defaults to the global funder if not provided.
+    pub authority: Option<Pubkey>,
+    /// The Whirlpool program and config account to target.
+    /// Uses [`WhirlpoolDeployment::default`] when `None`.
+    pub whirlpool_deployment: Option<WhirlpoolDeployment>,
+}
+
 /// Generates instructions to close a liquidity position.
 ///
 /// This function collects all fees and rewards, removes any remaining liquidity, and closes
@@ -296,8 +337,7 @@ pub struct ClosePositionInstruction {
 ///
 /// * `rpc` - A reference to a Solana RPC client for fetching accounts and pool data.
 /// * `position_mint_address` - The public key of the NFT mint address representing the position to be closed.
-/// * `slippage_tolerance_bps` - An optional slippage tolerance in basis points. Defaults to the global slippage tolerance if not provided.
-/// * `authority` - An optional public key of the account authorizing the transaction. Defaults to the global funder if not provided.
+/// * `config` - The parameters to build the close position instruction.
 ///
 /// # Returns
 ///
@@ -324,30 +364,27 @@ pub struct ClosePositionInstruction {
 ///
 /// ```rust
 /// use crate::utils::load_wallet;
-/// use orca_whirlpools::{
-///     close_position_instructions, set_whirlpools_config_address, WhirlpoolsConfigInput,
-/// };
+/// use orca_whirlpools::{close_position_instructions, ClosePositionConfig, WhirlpoolDeployment};
 /// use solana_client::nonblocking::rpc_client::RpcClient;
 /// use solana_pubkey::Pubkey;
 /// use std::str::FromStr;
 ///
 /// #[tokio::main]
 /// async fn main() {
-///     set_whirlpools_config_address(WhirlpoolsConfigInput::SolanaDevnet).unwrap();
 ///     let rpc = RpcClient::new("https://api.devnet.solana.com".to_string());
 ///     let wallet = load_wallet();
 ///
 ///     let position_mint_address =
 ///         Pubkey::from_str("HqoV7Qv27REUtmd9UKSJGGmCRNx3531t33bDG1BUfo9K").unwrap();
 ///
-///     let result = close_position_instructions(
-///         &rpc,
-///         position_mint_address,
-///         Some(100),
-///         Some(wallet.pubkey()),
-///     )
-///     .await
-///     .unwrap();
+///     let config = ClosePositionConfig {
+///         slippage_tolerance_bps: Some(100),
+///         authority: Some(wallet.pubkey()),
+///         whirlpool_deployment: Some(WhirlpoolDeployment::devnet()),
+///     };
+///     let result = close_position_instructions(&rpc, position_mint_address, config)
+///         .await
+///         .unwrap();
 ///
 ///     println!("Quote token max B: {:?}", result.quote.token_est_b);
 ///     println!("Fees Quote: {:?}", result.fees_quote);
@@ -358,17 +395,24 @@ pub struct ClosePositionInstruction {
 pub async fn close_position_instructions(
     rpc: &RpcClient,
     position_mint_address: Pubkey,
-    slippage_tolerance_bps: Option<u16>,
-    authority: Option<Pubkey>,
+    config: ClosePositionConfig,
 ) -> Result<ClosePositionInstruction, Box<dyn Error>> {
+    let ClosePositionConfig {
+        slippage_tolerance_bps,
+        authority,
+        whirlpool_deployment,
+    } = config;
+
     let slippage_tolerance_bps =
         slippage_tolerance_bps.unwrap_or(*SLIPPAGE_TOLERANCE_BPS.try_lock()?);
     let authority = authority.unwrap_or(*FUNDER.try_lock()?);
+    let whirlpool_deployment = whirlpool_deployment.unwrap_or_default();
     if authority == Pubkey::default() {
         return Err("Authority must be provided".into());
     }
 
-    let position_address = get_position_address(&position_mint_address)?.0;
+    let position_address =
+        get_position_address(&position_mint_address, Some(whirlpool_deployment.id()))?.0;
     let position_info = rpc.get_account(&position_address).await?;
     let position = Position::from_bytes(&position_info.data)?;
 
@@ -433,10 +477,18 @@ pub async fn close_position_instructions(
         &position_mint_address,
         &position_mint_info.owner,
     );
-    let lower_tick_array_address =
-        get_tick_array_address(&position.whirlpool, lower_tick_array_start_index)?.0;
-    let upper_tick_array_address =
-        get_tick_array_address(&position.whirlpool, upper_tick_array_start_index)?.0;
+    let lower_tick_array_address = get_tick_array_address(
+        &position.whirlpool,
+        lower_tick_array_start_index,
+        Some(whirlpool_deployment.id()),
+    )?
+    .0;
+    let upper_tick_array_address = get_tick_array_address(
+        &position.whirlpool,
+        upper_tick_array_start_index,
+        Some(whirlpool_deployment.id()),
+    )?
+    .0;
 
     let tick_array_infos = rpc
         .get_multiple_accounts(&[lower_tick_array_address, upper_tick_array_address])
@@ -517,54 +569,58 @@ pub async fn close_position_instructions(
         .ok_or("Token B owner account not found")?;
 
     if quote.liquidity_delta > 0 {
-        instructions.push(
-            DecreaseLiquidityV2 {
-                whirlpool: position.whirlpool,
-                token_program_a: mint_a_info.owner,
-                token_program_b: mint_b_info.owner,
-                memo_program: spl_memo_interface::v3::ID,
-                position_authority: authority,
-                position: position_address,
-                position_token_account: position_token_account_address,
-                token_mint_a: pool.token_mint_a,
-                token_mint_b: pool.token_mint_b,
-                token_owner_account_a: *token_owner_account_a,
-                token_owner_account_b: *token_owner_account_b,
-                token_vault_a: pool.token_vault_a,
-                token_vault_b: pool.token_vault_b,
-                tick_array_lower: lower_tick_array_address,
-                tick_array_upper: upper_tick_array_address,
-            }
-            .instruction(DecreaseLiquidityV2InstructionArgs {
-                liquidity_amount: quote.liquidity_delta,
-                token_min_a: quote.token_min_a,
-                token_min_b: quote.token_min_b,
-                remaining_accounts_info: None,
-            }),
-        );
+        let mut decrease_liquidity_v2_ix = DecreaseLiquidityV2 {
+            whirlpool: position.whirlpool,
+            token_program_a: mint_a_info.owner,
+            token_program_b: mint_b_info.owner,
+            memo_program: spl_memo_interface::v3::ID,
+            position_authority: authority,
+            position: position_address,
+            position_token_account: position_token_account_address,
+            token_mint_a: pool.token_mint_a,
+            token_mint_b: pool.token_mint_b,
+            token_owner_account_a: *token_owner_account_a,
+            token_owner_account_b: *token_owner_account_b,
+            token_vault_a: pool.token_vault_a,
+            token_vault_b: pool.token_vault_b,
+            tick_array_lower: lower_tick_array_address,
+            tick_array_upper: upper_tick_array_address,
+        }
+        .instruction(DecreaseLiquidityV2InstructionArgs {
+            liquidity_amount: quote.liquidity_delta,
+            token_min_a: quote.token_min_a,
+            token_min_b: quote.token_min_b,
+            remaining_accounts_info: None,
+        });
+
+        decrease_liquidity_v2_ix.program_id = whirlpool_deployment.id();
+
+        instructions.push(decrease_liquidity_v2_ix);
     }
 
     if fees_quote.fee_owed_a > 0 || fees_quote.fee_owed_b > 0 {
-        instructions.push(
-            CollectFeesV2 {
-                whirlpool: position.whirlpool,
-                position_authority: authority,
-                position: position_address,
-                position_token_account: position_token_account_address,
-                token_owner_account_a: *token_owner_account_a,
-                token_owner_account_b: *token_owner_account_b,
-                token_vault_a: pool.token_vault_a,
-                token_vault_b: pool.token_vault_b,
-                token_mint_a: pool.token_mint_a,
-                token_mint_b: pool.token_mint_b,
-                token_program_a: mint_a_info.owner,
-                token_program_b: mint_b_info.owner,
-                memo_program: spl_memo_interface::v3::ID,
-            }
-            .instruction(CollectFeesV2InstructionArgs {
-                remaining_accounts_info: None,
-            }),
-        );
+        let mut collect_fees_v2_ix = CollectFeesV2 {
+            whirlpool: position.whirlpool,
+            position_authority: authority,
+            position: position_address,
+            position_token_account: position_token_account_address,
+            token_owner_account_a: *token_owner_account_a,
+            token_owner_account_b: *token_owner_account_b,
+            token_vault_a: pool.token_vault_a,
+            token_vault_b: pool.token_vault_b,
+            token_mint_a: pool.token_mint_a,
+            token_mint_b: pool.token_mint_b,
+            token_program_a: mint_a_info.owner,
+            token_program_b: mint_b_info.owner,
+            memo_program: spl_memo_interface::v3::ID,
+        }
+        .instruction(CollectFeesV2InstructionArgs {
+            remaining_accounts_info: None,
+        });
+
+        collect_fees_v2_ix.program_id = whirlpool_deployment.id();
+
+        instructions.push(collect_fees_v2_ix);
     }
 
     for (i, _) in reward_infos.iter().enumerate().take(3) {
@@ -578,51 +634,58 @@ pub async fn close_position_instructions(
             .token_account_addresses
             .get(&pool.reward_infos[i].mint)
             .ok_or("Reward owner account not found")?;
-        instructions.push(
-            CollectRewardV2 {
-                whirlpool: position.whirlpool,
-                position_authority: authority,
-                position: position_address,
-                position_token_account: position_token_account_address,
-                reward_owner_account: *reward_owner,
-                reward_vault: pool.reward_infos[i].vault,
-                reward_mint: pool.reward_infos[i].mint,
-                reward_token_program: reward_info.owner,
-                memo_program: spl_memo_interface::v3::ID,
-            }
-            .instruction(CollectRewardV2InstructionArgs {
-                reward_index: i as u8,
-                remaining_accounts_info: None,
-            }),
-        );
+
+        let mut collect_reward_v2_ix = CollectRewardV2 {
+            whirlpool: position.whirlpool,
+            position_authority: authority,
+            position: position_address,
+            position_token_account: position_token_account_address,
+            reward_owner_account: *reward_owner,
+            reward_vault: pool.reward_infos[i].vault,
+            reward_mint: pool.reward_infos[i].mint,
+            reward_token_program: reward_info.owner,
+            memo_program: spl_memo_interface::v3::ID,
+        }
+        .instruction(CollectRewardV2InstructionArgs {
+            reward_index: i as u8,
+            remaining_accounts_info: None,
+        });
+
+        collect_reward_v2_ix.program_id = whirlpool_deployment.id();
+
+        instructions.push(collect_reward_v2_ix);
     }
 
     match position_mint_info.owner {
         spl_token_interface::ID => {
-            instructions.push(
-                ClosePosition {
-                    position_authority: authority,
-                    position: position_address,
-                    position_token_account: position_token_account_address,
-                    position_mint: position_mint_address,
-                    receiver: authority,
-                    token_program: spl_token_interface::ID,
-                }
-                .instruction(),
-            );
+            let mut close_position_ix = ClosePosition {
+                position_authority: authority,
+                position: position_address,
+                position_token_account: position_token_account_address,
+                position_mint: position_mint_address,
+                receiver: authority,
+                token_program: spl_token_interface::ID,
+            }
+            .instruction();
+
+            close_position_ix.program_id = whirlpool_deployment.id();
+
+            instructions.push(close_position_ix);
         }
         spl_token_2022_interface::ID => {
-            instructions.push(
-                ClosePositionWithTokenExtensions {
-                    position_authority: authority,
-                    position: position_address,
-                    position_token_account: position_token_account_address,
-                    position_mint: position_mint_address,
-                    receiver: authority,
-                    token2022_program: spl_token_2022_interface::ID,
-                }
-                .instruction(),
-            );
+            let mut close_position_with_token_extensions_ix = ClosePositionWithTokenExtensions {
+                position_authority: authority,
+                position: position_address,
+                position_token_account: position_token_account_address,
+                position_mint: position_mint_address,
+                receiver: authority,
+                token2022_program: spl_token_2022_interface::ID,
+            }
+            .instruction();
+
+            close_position_with_token_extensions_ix.program_id = whirlpool_deployment.id();
+
+            instructions.push(close_position_with_token_extensions_ix);
         }
         _ => {
             return Err("Unsupported token program".into());
@@ -666,9 +729,10 @@ mod tests {
             setup_ata_te, setup_ata_with_amount, setup_mint_te, setup_mint_te_fee,
             setup_mint_with_decimals, setup_position, setup_whirlpool, RpcContext, SetupAtaConfig,
         },
-        DecreaseLiquidityParam, IncreaseLiquidityParam, SwapType,
+        ClosePositionConfig, DecreaseLiquidityConfig, DecreaseLiquidityParam,
+        IncreaseLiquidityConfig, IncreaseLiquidityParam, SwapConfig, SwapType,
     };
-    use orca_whirlpools_client::{get_position_address, Position};
+    use orca_whirlpools_client::{get_position_address, Position, WhirlpoolDeployment};
 
     const RELATIVE_TOLERANCE_BPS: u128 = 50;
     const MIN_ABSOLUTE_BPS: u128 = 2;
@@ -711,8 +775,10 @@ mod tests {
         token_a_account: Pubkey,
         token_b_account: Pubkey,
         position_mint: Pubkey,
+        whirlpool_deployment: WhirlpoolDeployment,
     ) -> Result<(), Box<dyn Error>> {
-        let position_pubkey = get_position_address(&position_mint)?.0;
+        let position_pubkey =
+            get_position_address(&position_mint, Some(whirlpool_deployment.id()))?.0;
         let position_before = fetch_position(&ctx.rpc, position_pubkey).await?;
 
         // pre
@@ -832,111 +898,163 @@ mod tests {
     }
 
     #[rstest]
-    #[case("A-B",    "equally centered", -100, 100)]
-    #[case("A-B",    "one sided A",      -100, -1)]
-    #[case("A-B", "one sided B", 1, 100)]
-    #[case("A-TEA",  "equally centered", -100, 100)]
-    #[case("A-TEA",  "one sided A",      -100, -1)]
-    #[case("A-TEA", "one sided B", 1, 100)]
-    #[case("TEA-TEB","equally centered", -100, 100)]
-    #[case("TEA-TEB","one sided A",      -100, -1)]
-    #[case("TEA-TEB", "one sided B", 1, 100)]
-    #[case("A-TEFee","equally centered", -100, 100)]
-    #[case("A-TEFee","one sided A",      -100, -1)]
-    #[case("A-TEFee", "one sided B", 1, 100)]
+    #[case("A-B",    "equally centered", -100, 100, WhirlpoolDeployment::mainnet())]
+    #[case("A-B",    "equally centered", -100, 100, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("A-B",    "one sided A",      -100, -1, WhirlpoolDeployment::mainnet())]
+    #[case("A-B",    "one sided A",      -100, -1, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("A-B", "one sided B", 1, 100, WhirlpoolDeployment::mainnet())]
+    #[case("A-B", "one sided B", 1, 100, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("A-TEA",  "equally centered", -100, 100, WhirlpoolDeployment::mainnet())]
+    #[case("A-TEA",  "equally centered", -100, 100, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("A-TEA",  "one sided A",      -100, -1, WhirlpoolDeployment::mainnet())]
+    #[case("A-TEA",  "one sided A",      -100, -1, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("A-TEA", "one sided B", 1, 100, WhirlpoolDeployment::mainnet())]
+    #[case(
+        "A-TEA",
+        "one sided B",
+        1,
+        100,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case("TEA-TEB","equally centered", -100, 100, WhirlpoolDeployment::mainnet())]
+    #[case("TEA-TEB","equally centered", -100, 100, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("TEA-TEB","one sided A",      -100, -1, WhirlpoolDeployment::mainnet())]
+    #[case("TEA-TEB","one sided A",      -100, -1, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("TEA-TEB", "one sided B", 1, 100, WhirlpoolDeployment::mainnet())]
+    #[case(
+        "TEA-TEB",
+        "one sided B",
+        1,
+        100,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case("A-TEFee","equally centered", -100, 100, WhirlpoolDeployment::mainnet())]
+    #[case("A-TEFee","equally centered", -100, 100, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("A-TEFee","one sided A",      -100, -1, WhirlpoolDeployment::mainnet())]
+    #[case("A-TEFee","one sided A",      -100, -1, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("A-TEFee", "one sided B", 1, 100, WhirlpoolDeployment::mainnet())]
+    #[case(
+        "A-TEFee",
+        "one sided B",
+        1,
+        100,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[tokio::test]
     #[serial]
-    fn test_decrease_liquidity_cases(
+    async fn test_decrease_liquidity_cases(
         #[case] pool_name: &str,
         #[case] _position_name: &str,
         #[case] lower_tick: i32,
         #[case] upper_tick: i32,
+        #[case] whirlpool_deployment: WhirlpoolDeployment,
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let ctx = RpcContext::new();
+        let ctx = RpcContext::new();
 
-            let minted = setup_all_mints(&ctx).await.unwrap();
-            let user_atas = setup_all_atas(&ctx, &minted).await.unwrap();
+        let minted = setup_all_mints(&ctx).await.unwrap();
+        let user_atas = setup_all_atas(&ctx, &minted).await.unwrap();
 
-            let (mkey_a, mkey_b) = parse_pool_name(pool_name);
-            let pubkey_a = minted[mkey_a];
-            let pubkey_b = minted[mkey_b];
+        let (mkey_a, mkey_b) = parse_pool_name(pool_name);
+        let pubkey_a = minted[mkey_a];
+        let pubkey_b = minted[mkey_b];
 
-            let swapped = pubkey_a > pubkey_b;
-            let (final_a, final_b) = if pubkey_a < pubkey_b {
-                (pubkey_a, pubkey_b)
-            } else {
-                (pubkey_b, pubkey_a)
-            };
+        let swapped = pubkey_a > pubkey_b;
+        let (final_a, final_b) = if pubkey_a < pubkey_b {
+            (pubkey_a, pubkey_b)
+        } else {
+            (pubkey_b, pubkey_a)
+        };
 
-            let tick_spacing = 64;
-            let pool_pubkey = setup_whirlpool(&ctx, final_a, final_b, tick_spacing)
+        let tick_spacing = 64;
+        let pool_pubkey =
+            setup_whirlpool(&ctx, final_a, final_b, tick_spacing, whirlpool_deployment)
                 .await
                 .unwrap();
 
-            let position_mint =
-                setup_position(&ctx, pool_pubkey, Some((lower_tick, upper_tick)), None)
-                    .await
-                    .unwrap();
+        let position_mint = setup_position(
+            &ctx,
+            pool_pubkey,
+            Some((lower_tick, upper_tick)),
+            None,
+            whirlpool_deployment,
+        )
+        .await
+        .unwrap();
 
-            let inc_ix = increase_liquidity_instructions(
-                &ctx.rpc,
-                position_mint,
-                IncreaseLiquidityParam {
-                    token_max_a: 100_000,
-                    token_max_b: 100_000,
-                },
-                Some(100),
-                Some(ctx.signer.pubkey()),
-            )
+        let inc_ix = increase_liquidity_instructions(
+            &ctx.rpc,
+            position_mint,
+            IncreaseLiquidityParam {
+                token_max_a: 100_000,
+                token_max_b: 100_000,
+            },
+            IncreaseLiquidityConfig {
+                slippage_tolerance_bps: Some(100),
+                authority: Some(ctx.signer.pubkey()),
+                whirlpool_deployment: Some(whirlpool_deployment),
+            },
+        )
+        .await
+        .unwrap();
+        ctx.send_transaction_with_signers(inc_ix.instructions, vec![])
             .await
             .unwrap();
-            ctx.send_transaction_with_signers(inc_ix.instructions, vec![])
-                .await
-                .unwrap();
 
-            let dec_ix = decrease_liquidity_instructions(
-                &ctx.rpc,
-                position_mint,
-                DecreaseLiquidityParam::Liquidity(50_000),
-                Some(100),
-                Some(ctx.signer.pubkey()),
-            )
-            .await
-            .unwrap();
+        let config = DecreaseLiquidityConfig {
+            slippage_tolerance_bps: Some(100),
+            authority: Some(ctx.signer.pubkey()),
+            whirlpool_deployment: Some(whirlpool_deployment),
+        };
 
-            let user_ata_for_token_a = if swapped {
-                user_atas[mkey_b]
-            } else {
-                user_atas[mkey_a]
-            };
-            let user_ata_for_token_b = if swapped {
-                user_atas[mkey_a]
-            } else {
-                user_atas[mkey_b]
-            };
+        let dec_ix = decrease_liquidity_instructions(
+            &ctx.rpc,
+            position_mint,
+            DecreaseLiquidityParam::Liquidity(50_000),
+            config,
+        )
+        .await
+        .unwrap();
 
-            verify_decrease_liquidity(
-                &ctx,
-                &dec_ix,
-                user_ata_for_token_a,
-                user_ata_for_token_b,
-                position_mint,
-            )
-            .await
-            .unwrap();
-        });
+        let user_ata_for_token_a = if swapped {
+            user_atas[mkey_b]
+        } else {
+            user_atas[mkey_a]
+        };
+        let user_ata_for_token_b = if swapped {
+            user_atas[mkey_a]
+        } else {
+            user_atas[mkey_b]
+        };
+
+        verify_decrease_liquidity(
+            &ctx,
+            &dec_ix,
+            user_ata_for_token_a,
+            user_ata_for_token_b,
+            position_mint,
+            whirlpool_deployment,
+        )
+        .await
+        .unwrap();
     }
 
     #[rstest]
-    #[case("A-B",    "equally centered", -100, 100)]
-    #[case("A-B",    "one sided A",      -100, -1)]
-    #[case("A-TEA",  "equally centered", -100, 100)]
-    #[case("A-TEA",  "one sided A",      -100, -1)]
-    #[case("TEA-TEB","equally centered", -100, 100)]
-    #[case("TEA-TEB","one sided A",      -100, -1)]
-    #[case("A-TEFee","equally centered", -100, 100)]
-    #[case("A-TEFee","one sided A",      -100, -1)]
+    #[case("A-B",    "equally centered", -100, 100, WhirlpoolDeployment::mainnet())]
+    #[case("A-B",    "equally centered", -100, 100, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("A-B",    "one sided A",      -100, -1, WhirlpoolDeployment::mainnet())]
+    #[case("A-B",    "one sided A",      -100, -1, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("A-TEA",  "equally centered", -100, 100, WhirlpoolDeployment::mainnet())]
+    #[case("A-TEA",  "equally centered", -100, 100, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("A-TEA",  "one sided A",      -100, -1, WhirlpoolDeployment::mainnet())]
+    #[case("A-TEA",  "one sided A",      -100, -1, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("TEA-TEB","equally centered", -100, 100, WhirlpoolDeployment::mainnet())]
+    #[case("TEA-TEB","equally centered", -100, 100, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("TEA-TEB","one sided A",      -100, -1, WhirlpoolDeployment::mainnet())]
+    #[case("TEA-TEB","one sided A",      -100, -1, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("A-TEFee","equally centered", -100, 100, WhirlpoolDeployment::mainnet())]
+    #[case("A-TEFee","equally centered", -100, 100, WhirlpoolDeployment::mainnet_immutable())]
+    #[case("A-TEFee","one sided A",      -100, -1, WhirlpoolDeployment::mainnet())]
+    #[case("A-TEFee","one sided A",      -100, -1, WhirlpoolDeployment::mainnet_immutable())]
     #[tokio::test]
     #[serial]
     async fn test_close_position_cases(
@@ -944,6 +1062,7 @@ mod tests {
         #[case] range_name: &str,
         #[case] lower_tick: i32,
         #[case] upper_tick: i32,
+        #[case] whirlpool_deployment: WhirlpoolDeployment,
     ) -> Result<(), Box<dyn Error>> {
         let ctx = RpcContext::new();
         let minted = setup_all_mints(&ctx).await?;
@@ -960,9 +1079,16 @@ mod tests {
         };
 
         let tick_spacing = 64;
-        let pool_pubkey = setup_whirlpool(&ctx, final_a, final_b, tick_spacing).await?;
-        let position_mint =
-            setup_position(&ctx, pool_pubkey, Some((lower_tick, upper_tick)), None).await?;
+        let pool_pubkey =
+            setup_whirlpool(&ctx, final_a, final_b, tick_spacing, whirlpool_deployment).await?;
+        let position_mint = setup_position(
+            &ctx,
+            pool_pubkey,
+            Some((lower_tick, upper_tick)),
+            None,
+            whirlpool_deployment,
+        )
+        .await?;
 
         let inc_ix = increase_liquidity_instructions(
             &ctx.rpc,
@@ -971,8 +1097,11 @@ mod tests {
                 token_max_a: 100_000,
                 token_max_b: 100_000,
             },
-            Some(100),
-            Some(ctx.signer.pubkey()),
+            IncreaseLiquidityConfig {
+                slippage_tolerance_bps: Some(100),
+                authority: Some(ctx.signer.pubkey()),
+                whirlpool_deployment: Some(whirlpool_deployment),
+            },
         )
         .await?;
         ctx.send_transaction_with_signers(inc_ix.instructions, vec![])
@@ -984,8 +1113,11 @@ mod tests {
             100,
             final_a,
             SwapType::ExactIn,
-            Some(100),
-            Some(ctx.signer.pubkey()),
+            SwapConfig {
+                slippage_tolerance_bps: Some(100),
+                signer: Some(ctx.signer.pubkey()),
+                whirlpool_deployment: Some(whirlpool_deployment),
+            },
         )
         .await?;
         ctx.send_transaction_with_signers(
@@ -1016,15 +1148,19 @@ mod tests {
         let close_ix = close_position_instructions(
             &ctx.rpc,
             position_mint,
-            Some(100),
-            Some(ctx.signer.pubkey()),
+            ClosePositionConfig {
+                slippage_tolerance_bps: Some(100),
+                authority: Some(ctx.signer.pubkey()),
+                whirlpool_deployment: Some(whirlpool_deployment),
+            },
         )
         .await?;
         let signers: Vec<&Keypair> = close_ix.additional_signers.iter().collect();
         ctx.send_transaction_with_signers(close_ix.instructions.clone(), signers)
             .await?;
 
-        let position_address = get_position_address(&position_mint)?.0;
+        let position_address =
+            get_position_address(&position_mint, Some(whirlpool_deployment.id()))?.0;
         let position_after = maybe_fetch_position(&ctx.rpc, position_address).await?;
         assert!(
             position_after.is_none(),
@@ -1071,16 +1207,28 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    #[case(WhirlpoolDeployment::mainnet())]
+    #[case(WhirlpoolDeployment::mainnet_immutable())]
     #[tokio::test]
     #[serial]
-    async fn test_close_position_fails_if_missing_mint() -> Result<(), Box<dyn Error>> {
+    async fn test_close_position_fails_if_missing_mint(
+        #[case] whirlpool_deployment: WhirlpoolDeployment,
+    ) -> Result<(), Box<dyn Error>> {
         let ctx = RpcContext::new();
 
         let bogus_mint = Pubkey::new_unique();
 
-        let res =
-            close_position_instructions(&ctx.rpc, bogus_mint, Some(100), Some(ctx.signer.pubkey()))
-                .await;
+        let res = close_position_instructions(
+            &ctx.rpc,
+            bogus_mint,
+            ClosePositionConfig {
+                slippage_tolerance_bps: Some(100),
+                authority: Some(ctx.signer.pubkey()),
+                whirlpool_deployment: Some(whirlpool_deployment),
+            },
+        )
+        .await;
 
         assert!(
             res.is_err(),

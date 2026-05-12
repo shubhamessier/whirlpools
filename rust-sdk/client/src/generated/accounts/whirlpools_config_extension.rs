@@ -114,6 +114,12 @@ pub fn fetch_all_maybe_whirlpools_config_extension(
 
   #[cfg(feature = "anchor")]
   impl anchor_lang::Owner for WhirlpoolsConfigExtension {
+      /// Returns the mutable Whirlpool program ID.
+      ///
+      /// Using this with an account owned by the immutable Whirlpool program will
+      /// cause anchor's owner check to reject a valid account. Prefer fetching
+      /// the account via RPC and reading its `owner` field directly.
+      #[deprecated(note = "returns mutable Whirlpool program ID only")]
       fn owner() -> Pubkey {
         crate::WHIRLPOOL_ID
       }

@@ -7,6 +7,7 @@ use std::{
 use orca_whirlpools_client::{
     get_oracle_address, get_tick_array_address, AccountsType, Oracle, RemainingAccountsInfo,
     RemainingAccountsSlice, SwapV2, SwapV2InstructionArgs, TickArray, Whirlpool,
+    WhirlpoolDeployment,
 };
 use orca_whirlpools_core::{
     get_tick_array_start_tick_index, swap_quote_by_input_token, swap_quote_by_output_token,
@@ -27,9 +28,10 @@ use crate::{
 /// Represents the type of a swap operation.
 ///
 /// This enum is used to specify whether the swap is an exact input or exact output type.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum SwapType {
     /// Indicates a swap where the input token amount is specified.
+    #[default]
     ExactIn,
 
     /// Indicates a swap where the output token amount is specified.
@@ -78,6 +80,7 @@ async fn fetch_tick_arrays_or_default(
     rpc: &RpcClient,
     whirlpool_address: Pubkey,
     whirlpool: &Whirlpool,
+    program_id: Option<Pubkey>,
 ) -> Result<[(Pubkey, TickArrayFacade); 5], Box<dyn Error>> {
     let tick_array_start_index =
         get_tick_array_start_tick_index(whirlpool.tick_current_index, whirlpool.tick_spacing);
@@ -93,7 +96,7 @@ async fn fetch_tick_arrays_or_default(
 
     let tick_array_addresses: Vec<Pubkey> = tick_array_indexes
         .iter()
-        .map(|&x| get_tick_array_address(&whirlpool_address, x).map(|y| y.0))
+        .map(|&x| get_tick_array_address(&whirlpool_address, x, program_id).map(|y| y.0))
         .collect::<Result<Vec<Pubkey>, _>>()?;
 
     let tick_array_infos = rpc.get_multiple_accounts(&tick_array_addresses).await?;
@@ -131,6 +134,17 @@ async fn fetch_oracle(
     Ok(Some(Oracle::from_bytes(&oracle_info.data)?))
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SwapConfig {
+    /// An optional slippage tolerance, in basis points (BPS). Defaults to the global setting if not provided.
+    pub slippage_tolerance_bps: Option<u16>,
+    /// An optional public key of the wallet or account executing the swap. Defaults to the global funder if not provided.
+    pub signer: Option<Pubkey>,
+    /// The Whirlpool program and config account to target.
+    /// Uses [`WhirlpoolDeployment::default`] when `None`.
+    pub whirlpool_deployment: Option<WhirlpoolDeployment>,
+}
+
 /// Generates the instructions necessary to execute a token swap.
 ///
 /// This function generates instructions for executing swaps, supporting both exact input and exact output scenarios.
@@ -140,12 +154,10 @@ async fn fetch_oracle(
 ///
 /// * `rpc` - A reference to the Solana RPC client for fetching accounts and interacting with the blockchain.
 /// * `whirlpool_address` - The public key of the Whirlpool against which the swap will be executed.
-/// * `amount` - The token amount specified for the swap. For `SwapType::ExactIn`, this is the input token amount.
-///   For `SwapType::ExactOut`, this is the output token amount.
+/// * `amount` - The token amount specified for the swap.
 /// * `specified_mint` - The public key of the token mint being swapped.
-/// * `swap_type` - The type of swap (`SwapType::ExactIn` or `SwapType::ExactOut`).
-/// * `slippage_tolerance_bps` - An optional slippage tolerance, in basis points (BPS). Defaults to the global setting if not provided.
-/// * `signer` - An optional public key of the wallet or account executing the swap. Defaults to the global funder if not provided.
+/// * `swap_type` - The type of swap ([`SwapType::ExactIn`] or [`SwapType::ExactOut`]).
+/// * `config` - The parameters to build the swap instruction.
 ///
 /// # Returns
 ///
@@ -165,34 +177,32 @@ async fn fetch_oracle(
 ///
 /// ```rust
 /// use crate::utils::load_wallet;
-/// use orca_whirlpools::{
-///     set_whirlpools_config_address, swap_instructions, SwapType, WhirlpoolsConfigInput,
-/// };
+/// use orca_whirlpools::{swap_instructions, SwapConfig, SwapType, WhirlpoolDeployment};
 /// use solana_client::nonblocking::rpc_client::RpcClient;
 /// use solana_pubkey::Pubkey;
 /// use std::str::FromStr;
 ///
 /// #[tokio::main]
 /// async fn main() {
-///     set_whirlpools_config_address(WhirlpoolsConfigInput::SolanaDevnet).unwrap();
 ///     let rpc = RpcClient::new("https://api.devnet.solana.com".to_string());
 ///     let wallet = load_wallet();
 ///     let whirlpool_address =
 ///         Pubkey::from_str("3KBZiL2g8C7tiJ32hTv5v3KM7aK9htpqTw4cTXz1HvPt").unwrap();
 ///     let mint_address = Pubkey::from_str("BRjpCHtyQLNCo8gqRUr8jtdAj5AjPYQaoqbvcZiHok1k").unwrap();
-///     let input_amount = 1_000_000;
+///
+///     let config = SwapConfig {
+///         slippage_tolerance_bps: Some(100),
+///         signer: Some(wallet.pubkey()),
+///         whirlpool_deployment: Some(WhirlpoolDeployment::devnet()),
+///     };
 ///
 ///     let result = swap_instructions(
-///         &rpc,
+///         &rpc,         
 ///         whirlpool_address,
-///         input_amount,
-///         mint_address,
-///         SwapType::ExactIn,
-///         Some(100),
-///         Some(wallet.pubkey()),
-///     )
-///     .await
-///     .unwrap();
+///         1_000_000,
+///         specified_mint: mint_address,
+///         SwapType::ExactIn,config
+///     ).await.unwrap();
 ///
 ///     println!("Quote estimated token out: {:?}", result.quote);
 ///     println!("Number of Instructions: {}", result.instructions.len());
@@ -204,9 +214,15 @@ pub async fn swap_instructions(
     amount: u64,
     specified_mint: Pubkey,
     swap_type: SwapType,
-    slippage_tolerance_bps: Option<u16>,
-    signer: Option<Pubkey>,
+    config: SwapConfig,
 ) -> Result<SwapInstructions, Box<dyn Error>> {
+    let SwapConfig {
+        slippage_tolerance_bps,
+        signer,
+        whirlpool_deployment,
+    } = config;
+
+    let whirlpool_deployment = whirlpool_deployment.unwrap_or_default();
     let slippage_tolerance_bps =
         slippage_tolerance_bps.unwrap_or(*SLIPPAGE_TOLERANCE_BPS.try_lock()?);
     let signer = signer.unwrap_or(*FUNDER.try_lock()?);
@@ -220,7 +236,13 @@ pub async fn swap_instructions(
     let specified_token_a = specified_mint == whirlpool.token_mint_a;
     let a_to_b = specified_token_a == specified_input;
 
-    let tick_arrays = fetch_tick_arrays_or_default(rpc, whirlpool_address, &whirlpool).await?;
+    let tick_arrays = fetch_tick_arrays_or_default(
+        rpc,
+        whirlpool_address,
+        &whirlpool,
+        Some(whirlpool_deployment.id()),
+    )
+    .await?;
 
     let mint_infos = rpc
         .get_multiple_accounts(&[whirlpool.token_mint_a, whirlpool.token_mint_b])
@@ -234,7 +256,7 @@ pub async fn swap_instructions(
         .as_ref()
         .ok_or(format!("Mint b not found: {}", whirlpool.token_mint_b))?;
 
-    let oracle_address = get_oracle_address(&whirlpool_address)?.0;
+    let oracle_address = get_oracle_address(&whirlpool_address, Some(whirlpool_deployment.id()))?.0;
     let oracle = fetch_oracle(rpc, oracle_address, &whirlpool).await?;
 
     let current_epoch = rpc.get_epoch_info().await?.epoch;
@@ -311,7 +333,7 @@ pub async fn swap_instructions(
         .get(&whirlpool.token_mint_b)
         .ok_or("Token B owner account not found")?;
 
-    let swap_instruction = SwapV2 {
+    let mut swap_instruction = SwapV2 {
         token_program_a: mint_a_info.owner,
         token_program_b: mint_b_info.owner,
         memo_program: spl_memo_interface::v3::ID,
@@ -348,6 +370,8 @@ pub async fn swap_instructions(
         ],
     );
 
+    swap_instruction.program_id = whirlpool_deployment.id();
+
     instructions.push(swap_instruction);
     instructions.extend(token_accounts.cleanup_instructions);
 
@@ -383,8 +407,10 @@ mod tests {
             setup_ata_te, setup_ata_with_amount, setup_mint_te, setup_mint_te_fee,
             setup_mint_with_decimals, setup_position, setup_whirlpool, RpcContext, SetupAtaConfig,
         },
-        IncreaseLiquidityParam, SwapInstructions, SwapQuote, SwapType,
+        IncreaseLiquidityConfig, IncreaseLiquidityParam, SwapConfig, SwapInstructions, SwapQuote,
+        SwapType,
     };
+    use orca_whirlpools_client::WhirlpoolDeployment;
 
     async fn get_token_balance(rpc: &RpcClient, address: Pubkey) -> Result<u64, Box<dyn Error>> {
         let account_data = rpc.get_account(&address).await?;
@@ -515,128 +541,301 @@ mod tests {
     }
 
     #[rstest]
-    #[case("A-B", true, SwapType::ExactIn, 1000)]
-    #[case("A-B", true, SwapType::ExactOut, 500)]
-    #[case("A-B", false, SwapType::ExactIn, 200)]
-    #[case("A-B", false, SwapType::ExactOut, 100)]
-    #[case("A-TEA", true, SwapType::ExactIn, 1000)]
-    #[case("A-TEA", true, SwapType::ExactOut, 500)]
-    #[case("A-TEA", false, SwapType::ExactIn, 200)]
-    #[case("A-TEA", false, SwapType::ExactOut, 100)]
-    #[case("TEA-TEB", true, SwapType::ExactIn, 1000)]
-    #[case("TEA-TEB", true, SwapType::ExactOut, 500)]
-    #[case("TEA-TEB", false, SwapType::ExactIn, 200)]
-    #[case("TEA-TEB", false, SwapType::ExactOut, 100)]
-    #[case("A-TEFee", true, SwapType::ExactIn, 1000)]
-    #[case("A-TEFee", true, SwapType::ExactOut, 500)]
-    #[case("A-TEFee", false, SwapType::ExactIn, 200)]
-    #[case("A-TEFee", false, SwapType::ExactOut, 100)]
+    #[case("A-B", true, SwapType::ExactIn, 1000, WhirlpoolDeployment::mainnet())]
+    #[case(
+        "A-B",
+        true,
+        SwapType::ExactIn,
+        1000,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case("A-B", true, SwapType::ExactOut, 500, WhirlpoolDeployment::mainnet())]
+    #[case(
+        "A-B",
+        true,
+        SwapType::ExactOut,
+        500,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case("A-B", false, SwapType::ExactIn, 200, WhirlpoolDeployment::mainnet())]
+    #[case(
+        "A-B",
+        false,
+        SwapType::ExactIn,
+        200,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case("A-B", false, SwapType::ExactOut, 100, WhirlpoolDeployment::mainnet())]
+    #[case(
+        "A-B",
+        false,
+        SwapType::ExactOut,
+        100,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case("A-TEA", true, SwapType::ExactIn, 1000, WhirlpoolDeployment::mainnet())]
+    #[case(
+        "A-TEA",
+        true,
+        SwapType::ExactIn,
+        1000,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case("A-TEA", true, SwapType::ExactOut, 500, WhirlpoolDeployment::mainnet())]
+    #[case(
+        "A-TEA",
+        true,
+        SwapType::ExactOut,
+        500,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case("A-TEA", false, SwapType::ExactIn, 200, WhirlpoolDeployment::mainnet())]
+    #[case(
+        "A-TEA",
+        false,
+        SwapType::ExactIn,
+        200,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case(
+        "A-TEA",
+        false,
+        SwapType::ExactOut,
+        100,
+        WhirlpoolDeployment::mainnet()
+    )]
+    #[case(
+        "A-TEA",
+        false,
+        SwapType::ExactOut,
+        100,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case(
+        "TEA-TEB",
+        true,
+        SwapType::ExactIn,
+        1000,
+        WhirlpoolDeployment::mainnet()
+    )]
+    #[case(
+        "TEA-TEB",
+        true,
+        SwapType::ExactIn,
+        1000,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case(
+        "TEA-TEB",
+        true,
+        SwapType::ExactOut,
+        500,
+        WhirlpoolDeployment::mainnet()
+    )]
+    #[case(
+        "TEA-TEB",
+        true,
+        SwapType::ExactOut,
+        500,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case(
+        "TEA-TEB",
+        false,
+        SwapType::ExactIn,
+        200,
+        WhirlpoolDeployment::mainnet()
+    )]
+    #[case(
+        "TEA-TEB",
+        false,
+        SwapType::ExactIn,
+        200,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case(
+        "TEA-TEB",
+        false,
+        SwapType::ExactOut,
+        100,
+        WhirlpoolDeployment::mainnet()
+    )]
+    #[case(
+        "TEA-TEB",
+        false,
+        SwapType::ExactOut,
+        100,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case(
+        "A-TEFee",
+        true,
+        SwapType::ExactIn,
+        1000,
+        WhirlpoolDeployment::mainnet()
+    )]
+    #[case(
+        "A-TEFee",
+        true,
+        SwapType::ExactIn,
+        1000,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case(
+        "A-TEFee",
+        true,
+        SwapType::ExactOut,
+        500,
+        WhirlpoolDeployment::mainnet()
+    )]
+    #[case(
+        "A-TEFee",
+        true,
+        SwapType::ExactOut,
+        500,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case(
+        "A-TEFee",
+        false,
+        SwapType::ExactIn,
+        200,
+        WhirlpoolDeployment::mainnet()
+    )]
+    #[case(
+        "A-TEFee",
+        false,
+        SwapType::ExactIn,
+        200,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[case(
+        "A-TEFee",
+        false,
+        SwapType::ExactOut,
+        100,
+        WhirlpoolDeployment::mainnet()
+    )]
+    #[case(
+        "A-TEFee",
+        false,
+        SwapType::ExactOut,
+        100,
+        WhirlpoolDeployment::mainnet_immutable()
+    )]
+    #[tokio::test]
     #[serial]
-    fn test_swap_scenarios(
+    async fn test_swap_scenarios(
         #[case] pool_name: &str,
         #[case] a_to_b: bool,
         #[case] swap_type: SwapType,
         #[case] amount: u64,
+        #[case] whirlpool_deployment: WhirlpoolDeployment,
     ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let ctx = RpcContext::new();
+        let ctx = RpcContext::new();
 
-            let minted = setup_all_mints(&ctx).await.unwrap();
-            let user_atas = setup_all_atas(&ctx, &minted).await.unwrap();
+        let minted = setup_all_mints(&ctx).await.unwrap();
+        let user_atas = setup_all_atas(&ctx, &minted).await.unwrap();
 
-            let (mkey_a, mkey_b) = parse_pool_name(pool_name);
-            let pubkey_a = minted[mkey_a];
-            let pubkey_b = minted[mkey_b];
+        let (mkey_a, mkey_b) = parse_pool_name(pool_name);
+        let pubkey_a = minted[mkey_a];
+        let pubkey_b = minted[mkey_b];
 
-            let tick_spacing = 64;
-            let (final_a, final_b) = if pubkey_a < pubkey_b {
-                (pubkey_a, pubkey_b)
-            } else {
-                (pubkey_b, pubkey_a)
-            };
+        let tick_spacing = 64;
+        let (final_a, final_b) = if pubkey_a < pubkey_b {
+            (pubkey_a, pubkey_b)
+        } else {
+            (pubkey_b, pubkey_a)
+        };
 
-            let pool_pubkey = setup_whirlpool(&ctx, final_a, final_b, tick_spacing)
+        let pool_pubkey =
+            setup_whirlpool(&ctx, final_a, final_b, tick_spacing, whirlpool_deployment)
                 .await
                 .unwrap();
 
-            let position_mint = setup_position(
-                &ctx,
-                pool_pubkey,
-                Some((-192, 192)), // aligned to spacing=64
-                None,
-            )
-            .await
-            .unwrap();
+        let position_mint = setup_position(
+            &ctx,
+            pool_pubkey,
+            Some((-192, 192)), // aligned to spacing=64
+            None,
+            whirlpool_deployment,
+        )
+        .await
+        .unwrap();
 
-            let liq_ix = increase_liquidity_instructions(
-                &ctx.rpc,
-                position_mint,
-                IncreaseLiquidityParam {
-                    token_max_a: 1_000_000,
-                    token_max_b: 1_000_000,
-                },
-                Some(100), // 1% slippage
-                Some(ctx.signer.pubkey()),
-            )
-            .await
-            .unwrap();
-            ctx.send_transaction_with_signers(
-                liq_ix.instructions,
-                liq_ix.additional_signers.iter().collect(),
-            )
-            .await
-            .unwrap();
+        let liq_ix = increase_liquidity_instructions(
+            &ctx.rpc,
+            position_mint,
+            IncreaseLiquidityParam {
+                token_max_a: 1_000_000,
+                token_max_b: 1_000_000,
+            },
+            IncreaseLiquidityConfig {
+                slippage_tolerance_bps: Some(100),
+                authority: Some(ctx.signer.pubkey()),
+                whirlpool_deployment: Some(whirlpool_deployment),
+            },
+        )
+        .await
+        .unwrap();
+        ctx.send_transaction_with_signers(
+            liq_ix.instructions,
+            liq_ix.additional_signers.iter().collect(),
+        )
+        .await
+        .unwrap();
 
-            let user_ata_for_final_a = if final_a == pubkey_a {
-                user_atas[mkey_a]
-            } else {
-                user_atas[mkey_b]
-            };
-            let user_ata_for_final_b = if final_b == pubkey_b {
-                user_atas[mkey_b]
-            } else {
-                user_atas[mkey_a]
-            };
+        let user_ata_for_final_a = if final_a == pubkey_a {
+            user_atas[mkey_a]
+        } else {
+            user_atas[mkey_b]
+        };
+        let user_ata_for_final_b = if final_b == pubkey_b {
+            user_atas[mkey_b]
+        } else {
+            user_atas[mkey_a]
+        };
 
-            let token_for_this_call = match swap_type {
-                SwapType::ExactIn => {
-                    if a_to_b {
-                        final_a
-                    } else {
-                        final_b
-                    }
+        let token_for_this_call = match swap_type {
+            SwapType::ExactIn => {
+                if a_to_b {
+                    final_a
+                } else {
+                    final_b
                 }
-                SwapType::ExactOut => {
-                    if a_to_b {
-                        final_b
-                    } else {
-                        final_a
-                    }
+            }
+            SwapType::ExactOut => {
+                if a_to_b {
+                    final_b
+                } else {
+                    final_a
                 }
-            };
+            }
+        };
 
-            let swap_ix = swap_instructions(
-                &ctx.rpc,
-                pool_pubkey,
-                amount,
-                token_for_this_call,
-                swap_type.clone(),
-                Some(100), // slippage
-                Some(ctx.signer.pubkey()),
-            )
-            .await
-            .unwrap();
+        let swap_ix = swap_instructions(
+            &ctx.rpc,
+            pool_pubkey,
+            amount,
+            token_for_this_call,
+            swap_type.clone(),
+            SwapConfig {
+                slippage_tolerance_bps: Some(100),
+                signer: Some(ctx.signer.pubkey()),
+                whirlpool_deployment: Some(whirlpool_deployment),
+            },
+        )
+        .await
+        .unwrap();
 
-            verify_swap(
-                &ctx,
-                &swap_ix,
-                user_ata_for_final_a,
-                user_ata_for_final_b,
-                a_to_b,
-            )
-            .await
-            .unwrap();
-        });
+        verify_swap(
+            &ctx,
+            &swap_ix,
+            user_ata_for_final_a,
+            user_ata_for_final_b,
+            a_to_b,
+        )
+        .await
+        .unwrap();
     }
 }
