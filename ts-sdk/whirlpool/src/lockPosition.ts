@@ -1,7 +1,10 @@
-import type { LockType } from "@orca-so/whirlpools-client";
+import type { LockType, WhirlpoolDeployment } from "@orca-so/whirlpools-client";
 import type { Address, Instruction, TransactionSigner } from "@solana/kit";
 
-import { getLockPositionInstruction } from "@orca-so/whirlpools-client";
+import {
+  DEFAULT_WHIRLPOOL_DEPLOYMENT,
+  getLockPositionInstruction,
+} from "@orca-so/whirlpools-client";
 import { TOKEN_2022_PROGRAM_ADDRESS } from "@solana-program/token-2022";
 import { address } from "@solana/kit";
 import { SystemProgram } from "@solana/web3.js";
@@ -17,6 +20,7 @@ import { SystemProgram } from "@solana/web3.js";
  * @param positionTokenAccount - The associated token address for the position token in the owners wallet.
  * @param lockConfigPda - PDA for the LockConfig account that will be created to manage lock state.
  * @param whirlpool - PublicKey for the whirlpool that the position belongs to.
+ * @param whirlpoolDeployment - The Whirlpool program and config account to target. Defaults to DEFAULT_WHIRLPOOL_DEPLOYMENT if not provided.
  */
 export type LockPositionParams = {
   lockType: LockType;
@@ -27,6 +31,7 @@ export type LockPositionParams = {
   positionTokenAccount: Address;
   lockConfigPda: Address;
   whirlpool: Address;
+  whirlpoolDeployment?: WhirlpoolDeployment;
 };
 
 /**
@@ -44,14 +49,13 @@ export type LockPositionInstructions = {
  * @returns {Promise<LockPositionInstructions>} A promise that resolves to an object containing instructions.
  *
  * @example
- * import { lockPositionInstructions, setWhirlpoolsConfig } from "@orca-so/whirlpools";
+ * import { lockPositionInstructions, WhirlpoolDeployment } from "@orca-so/whirlpools";
  * import { getLockConfigAddress, LockTypeLabel } from "@orca-so/whirlpools-client";
  * import { TOKEN_2022_PROGRAM_ADDRESS } from "@solana-program/token-2022";
  * import { address, createSolanaRpc, devnet } from "@solana/kit";
  * import { SystemProgram } from "@solana/web3.js";
  * import { loadWallet } from "./utils";
  *
- * await setWhirlpoolsConfig("solanaDevnet");
  * const devnetRpc = createSolanaRpc(devnet("https://api.devnet.solana.com"));
  * const wallet = await loadWallet();
  *
@@ -70,26 +74,33 @@ export type LockPositionInstructions = {
  *   whirlpool,
  *   lockConfig: lockConfigPda,
  *   lockType: LockTypeLabel.Permanent,
+ *   whirlpoolDeployment: WhirlpoolDeployment.devnet,
  * });
  */
 export async function lockPositionInstructions(
   params: LockPositionParams,
 ): Promise<LockPositionInstructions> {
+  const whirlpoolDeployment =
+    params.whirlpoolDeployment ?? DEFAULT_WHIRLPOOL_DEPLOYMENT;
+
   const instructions: Instruction[] = [];
 
   instructions.push(
-    getLockPositionInstruction({
-      funder: params.funder,
-      positionAuthority: params.positionAuthority,
-      position: params.position,
-      positionMint: params.positionMint,
-      positionTokenAccount: params.positionTokenAccount,
-      lockConfig: params.lockConfigPda,
-      whirlpool: params.whirlpool,
-      token2022Program: TOKEN_2022_PROGRAM_ADDRESS,
-      systemProgram: address(SystemProgram.programId.toBase58()),
-      lockType: params.lockType,
-    }),
+    getLockPositionInstruction(
+      {
+        funder: params.funder,
+        positionAuthority: params.positionAuthority,
+        position: params.position,
+        positionMint: params.positionMint,
+        positionTokenAccount: params.positionTokenAccount,
+        lockConfig: params.lockConfigPda,
+        whirlpool: params.whirlpool,
+        token2022Program: TOKEN_2022_PROGRAM_ADDRESS,
+        systemProgram: address(SystemProgram.programId.toBase58()),
+        lockType: params.lockType,
+      },
+      { programAddress: whirlpoolDeployment.programId },
+    ),
   );
 
   return {

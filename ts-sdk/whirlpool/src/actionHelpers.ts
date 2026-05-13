@@ -6,7 +6,7 @@ import {
   type Rpc,
   type Signature,
   type SolanaRpcApi,
-  type TransactionSigner,
+  type KeyPairSigner,
 } from "@solana/kit";
 import { getPayer, getRpcConfig } from "./config";
 import {
@@ -16,32 +16,38 @@ import {
 } from "@orca-so/tx-sender";
 
 /**
- * A generic wrapper function to reduce boilerplate when working with Whirlpool instructions
- * @param instructionFn The Whirlpool instruction function to execute
- * @returns A wrapped function that automatically includes rpc and owner params
+ * Result returned by wrapped Whirlpool actions.
+ *
+ * Combines the instructions result with a `callback` that builds and sends
+ * the transaction.
  */
-export function wrapFunctionWithExecution<T extends unknown[], R>(
-  instructionFn: (
-    rpc: Rpc<SolanaRpcApi>,
-    ...params: [...T, TransactionSigner]
-  ) => Promise<R & { instructions: Instruction[] }>,
-): (...params: T) => Promise<R & { callback: () => Promise<Signature> }> {
-  return async (...params: T) => {
-    const { rpcUrl } = getRpcConfig();
-    const rpc = rpcFromUrl(rpcUrl);
-    const owner = getPayer();
+export type ActionResult<R> = R & {
+  callback: (payer?: KeyPairSigner) => Promise<Signature>;
+};
 
-    const result = await instructionFn(rpc, ...params, owner);
-
-    return {
-      ...result,
-      callback: () => buildAndSendTransaction(result.instructions, owner),
-    };
+/**
+ * Helper that fetches the configured RPC and wires up the
+ * `callback` for sending the resulting instructions.
+ *
+ * Use this from each action wrapper to avoid duplicating the boilerplate.
+ */
+export async function executeWithCallback<
+  R extends { instructions: Instruction[] },
+>(build: (rpc: Rpc<SolanaRpcApi>) => Promise<R>): Promise<ActionResult<R>> {
+  const { rpcUrl } = getRpcConfig();
+  const rpc = rpcFromUrl(rpcUrl);
+  const result = await build(rpc);
+  return {
+    ...result,
+    callback: (payer?: KeyPairSigner) => {
+      let funder = payer ?? getPayer();
+      return buildAndSendTransaction(result.instructions, funder);
+    },
   };
 }
 
 /**
- * Check if adding additional instructions would exceed transaction size limits
+ * Check if adding additional instructions would exceed transaction size limits.
  * @param currentInstructions Current list of instructions in transaction
  * @param instructionsToAdd Instructions to check if they can be added
  * @returns True if adding instructions would exceed size limit, false otherwise
@@ -50,12 +56,12 @@ export async function wouldExceedTransactionSize(
   currentInstructions: Instruction[],
   instructionsToAdd: Instruction[],
 ): Promise<boolean> {
-  const noopSginer = createNoopSigner(
+  const noopSigner = createNoopSigner(
     address("11111111111111111111111111111111"),
   );
   const tx = await buildTransaction(
     [...currentInstructions, ...instructionsToAdd],
-    noopSginer,
+    noopSigner,
   );
   const encodedTransaction = getBase64EncodedWireTransaction(tx);
 

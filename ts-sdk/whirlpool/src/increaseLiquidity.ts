@@ -1,5 +1,9 @@
-import type { Whirlpool } from "@orca-so/whirlpools-client";
+import type {
+  Whirlpool,
+  WhirlpoolDeployment,
+} from "@orca-so/whirlpools-client";
 import {
+  DEFAULT_WHIRLPOOL_DEPLOYMENT,
   fetchAllMaybeTickArray,
   fetchPosition,
   fetchWhirlpool,
@@ -50,7 +54,7 @@ import {
 import { MEMO_PROGRAM_ADDRESS } from "@solana-program/memo";
 import assert from "assert";
 import { calculateMinimumBalanceForRentExemption } from "./sysvar";
-import { wrapFunctionWithExecution } from "./actionHelpers";
+import { executeWithCallback } from "./actionHelpers";
 import { getSqrtPriceSlippageBounds } from "@orca-so/whirlpools-core";
 
 // TODO: allow specify number as well as bigint
@@ -63,17 +67,13 @@ type IncreaseLiquidityRpc = Rpc<
     GetMinimumBalanceForRentExemptionApi
 >;
 
-/**
- * Represents the token max amount parameters for increasing liquidity.
- */
+/** Represents the token max amount parameters for increasing liquidity. */
 export type IncreaseLiquidityParam = {
   tokenMaxA: bigint;
   tokenMaxB: bigint;
 };
 
-/**
- * Represents the instructions for increasing liquidity in a position.
- */
+/** Represents the instructions for increasing liquidity in a position. */
 export type IncreaseLiquidityInstructions = {
   /** List of Solana transaction instructions to execute. */
   instructions: Instruction[];
@@ -94,6 +94,7 @@ async function getIncreaseLiquidityInstructions(
     mintB,
     slippageToleranceBps,
     authority,
+    programAddress,
     ...rest
   }: {
     whirlpool: Account<Whirlpool>;
@@ -102,6 +103,7 @@ async function getIncreaseLiquidityInstructions(
     mintB: Account<Mint>;
     slippageToleranceBps: number;
     authority: TransactionSigner<string>;
+    programAddress: Address;
     position: Address;
     positionTokenAccount: Address;
     tickArrayLower: Address;
@@ -144,15 +146,18 @@ async function getIncreaseLiquidityInstructions(
   );
 
   const increaseLiquidityInstruction =
-    getIncreaseLiquidityByTokenAmountsV2Instruction({
-      method: increaseLiquidityMethod("ByTokenAmounts", {
-        minSqrtPrice,
-        maxSqrtPrice,
-        tokenMaxA,
-        tokenMaxB,
-      }),
-      ...commonInstructionParams,
-    });
+    getIncreaseLiquidityByTokenAmountsV2Instruction(
+      {
+        method: increaseLiquidityMethod("ByTokenAmounts", {
+          minSqrtPrice,
+          maxSqrtPrice,
+          tokenMaxA,
+          tokenMaxB,
+        }),
+        ...commonInstructionParams,
+      },
+      { programAddress },
+    );
 
   return {
     createTokenAccountInstructions,
@@ -162,21 +167,33 @@ async function getIncreaseLiquidityInstructions(
 }
 
 /**
+ * Options for {@link increaseLiquidityInstructions}.
+ */
+export type IncreaseLiquidityConfig = {
+  /** Slippage tolerance in basis points. Defaults to the global slippage tolerance. */
+  slippageToleranceBps?: number;
+  /** The account authorizing the liquidity addition. Defaults to the global funder. */
+  authority?: TransactionSigner<string>;
+  /**
+   * The Whirlpool program and config account to target. Defaults to DEFAULT_WHIRLPOOL_DEPLOYMENT if not provided.
+   */
+  whirlpoolDeployment?: WhirlpoolDeployment;
+};
+
+/**
  * Generates instructions to increase liquidity for an existing position.
  *
- * @param {SolanaRpc} rpc - RPC client. Requires: GetAccountInfoApi, GetMultipleAccountsApi, GetMinimumBalanceForRentExemptionApi
+ * @param {SolanaRpc} rpc - RPC client.
  * @param {Address} positionMintAddress - The mint address of the NFT that represents the position.
  * @param {IncreaseLiquidityParam} param - Maximum amounts of token A and B to deposit.
- * @param {number} [slippageToleranceBps=SLIPPAGE_TOLERANCE_BPS] - The maximum acceptable slippage, in basis points (BPS).
- * @param {TransactionSigner} [authority=FUNDER] - The account that authorizes the transaction.
+ * @param {IncreaseLiquidityConfig} [config] - The parameters to build the increase liquidity instruction.
  * @returns {Promise<IncreaseLiquidityInstructions>} A promise that resolves to an object containing instructions.
  *
  * @example
- * import { increaseLiquidityInstructions, setWhirlpoolsConfig } from '@orca-so/whirlpools';
+ * import { increaseLiquidityInstructions, WhirlpoolDeployment } from '@orca-so/whirlpools';
  * import { createSolanaRpc, devnet, address } from '@solana/kit';
  * import { loadWallet } from './utils';
  *
- * await setWhirlpoolsConfig('solanaDevnet');
  * const devnetRpc = createSolanaRpc(devnet('https://api.devnet.solana.com'));
  * const wallet = await loadWallet();
  * const positionMint = address("HqoV7Qv27REUtmd9UKSJGGmCRNx3531t33bDG1BUfo9K");
@@ -184,23 +201,34 @@ async function getIncreaseLiquidityInstructions(
  *   devnetRpc,
  *   positionMint,
  *   { tokenMaxA: 10n, tokenMaxB: 12n },
- *   100,
- *   wallet
+ *   {
+ *     slippageToleranceBps: 100,
+ *     authority: wallet,
+ *     whirlpoolDeployment: WhirlpoolDeployment.devnet,
+ *   }
  * );
  */
 export async function increaseLiquidityInstructions(
   rpc: IncreaseLiquidityRpc,
   positionMintAddress: Address,
   param: IncreaseLiquidityParam,
-  slippageToleranceBps: number = SLIPPAGE_TOLERANCE_BPS,
-  authority: TransactionSigner<string> = FUNDER,
+  config: IncreaseLiquidityConfig = {},
 ): Promise<IncreaseLiquidityInstructions> {
+  const slippageToleranceBps =
+    config.slippageToleranceBps ?? SLIPPAGE_TOLERANCE_BPS;
+  const authority = config.authority ?? FUNDER;
+  const whirlpoolDeployment =
+    config.whirlpoolDeployment ?? DEFAULT_WHIRLPOOL_DEPLOYMENT;
+
   assert(
     authority.address !== DEFAULT_ADDRESS,
     "Either supply the authority or set the default funder",
   );
 
-  const positionAddress = await getPositionAddress(positionMintAddress);
+  const positionAddress = await getPositionAddress(
+    positionMintAddress,
+    whirlpoolDeployment.programId,
+  );
   const position = await fetchPosition(rpc, positionAddress[0]);
   const whirlpool = await fetchWhirlpool(rpc, position.data.whirlpool);
 
@@ -226,12 +254,16 @@ export async function increaseLiquidityInstructions(
         mint: positionMintAddress,
         tokenProgram: positionMint.programAddress,
       }).then((x) => x[0]),
-      getTickArrayAddress(whirlpool.address, lowerTickArrayStartIndex).then(
-        (x) => x[0],
-      ),
-      getTickArrayAddress(whirlpool.address, upperTickArrayStartIndex).then(
-        (x) => x[0],
-      ),
+      getTickArrayAddress(
+        whirlpool.address,
+        lowerTickArrayStartIndex,
+        whirlpoolDeployment.programId,
+      ).then((x) => x[0]),
+      getTickArrayAddress(
+        whirlpool.address,
+        upperTickArrayStartIndex,
+        whirlpoolDeployment.programId,
+      ).then((x) => x[0]),
     ]);
 
   const {
@@ -247,6 +279,7 @@ export async function increaseLiquidityInstructions(
     mintB,
     slippageToleranceBps,
     authority,
+    programAddress: whirlpoolDeployment.programId,
     tickArrayLower,
     tickArrayUpper,
     tickLowerIndex: position.data.tickLowerIndex,
@@ -284,9 +317,10 @@ async function internalOpenPositionInstructions(
   upperTickIndex: number,
   mintA: Account<Mint>,
   mintB: Account<Mint>,
-  slippageToleranceBps: number = SLIPPAGE_TOLERANCE_BPS,
-  withTokenMetadataExtension: boolean = true,
-  funder: TransactionSigner<string> = FUNDER,
+  slippageToleranceBps: number,
+  withTokenMetadataExtension: boolean,
+  funder: TransactionSigner<string>,
+  whirlpoolDeployment: WhirlpoolDeployment,
 ): Promise<OpenPositionInstructions> {
   assert(
     funder.address !== DEFAULT_ADDRESS,
@@ -327,18 +361,22 @@ async function internalOpenPositionInstructions(
     lowerTickArrayAddress,
     upperTickArrayAddress,
   ] = await Promise.all([
-    getPositionAddress(positionMint.address),
+    getPositionAddress(positionMint.address, whirlpoolDeployment.programId),
     findAssociatedTokenPda({
       owner: funder.address,
       mint: positionMint.address,
       tokenProgram: TOKEN_2022_PROGRAM_ADDRESS,
     }).then((x) => x[0]),
-    getTickArrayAddress(whirlpool.address, lowerTickArrayIndex).then(
-      (x) => x[0],
-    ),
-    getTickArrayAddress(whirlpool.address, upperTickArrayIndex).then(
-      (x) => x[0],
-    ),
+    getTickArrayAddress(
+      whirlpool.address,
+      lowerTickArrayIndex,
+      whirlpoolDeployment.programId,
+    ).then((x) => x[0]),
+    getTickArrayAddress(
+      whirlpool.address,
+      upperTickArrayIndex,
+      whirlpoolDeployment.programId,
+    ).then((x) => x[0]),
   ]);
 
   const {
@@ -354,6 +392,7 @@ async function internalOpenPositionInstructions(
     mintB,
     slippageToleranceBps,
     authority: funder,
+    programAddress: whirlpoolDeployment.programId,
     tickArrayLower: lowerTickArrayAddress,
     tickArrayUpper: upperTickArrayAddress,
     tickLowerIndex: initializableLowerTickIndex,
@@ -369,13 +408,16 @@ async function internalOpenPositionInstructions(
 
   if (!lowerTickArray.exists) {
     instructions.push(
-      getInitializeDynamicTickArrayInstruction({
-        whirlpool: whirlpool.address,
-        funder,
-        tickArray: lowerTickArrayAddress,
-        startTickIndex: lowerTickArrayIndex,
-        idempotent: false,
-      }),
+      getInitializeDynamicTickArrayInstruction(
+        {
+          whirlpool: whirlpool.address,
+          funder,
+          tickArray: lowerTickArrayAddress,
+          startTickIndex: lowerTickArrayIndex,
+          idempotent: false,
+        },
+        { programAddress: whirlpoolDeployment.programId },
+      ),
     );
     nonRefundableRent += calculateMinimumBalanceForRentExemption(
       rent,
@@ -385,13 +427,16 @@ async function internalOpenPositionInstructions(
 
   if (!upperTickArray.exists && lowerTickArrayIndex !== upperTickArrayIndex) {
     instructions.push(
-      getInitializeDynamicTickArrayInstruction({
-        whirlpool: whirlpool.address,
-        funder,
-        tickArray: upperTickArrayAddress,
-        startTickIndex: upperTickArrayIndex,
-        idempotent: false,
-      }),
+      getInitializeDynamicTickArrayInstruction(
+        {
+          whirlpool: whirlpool.address,
+          funder,
+          tickArray: upperTickArrayAddress,
+          startTickIndex: upperTickArrayIndex,
+          idempotent: false,
+        },
+        { programAddress: whirlpoolDeployment.programId },
+      ),
     );
     nonRefundableRent += calculateMinimumBalanceForRentExemption(
       rent,
@@ -400,22 +445,25 @@ async function internalOpenPositionInstructions(
   }
 
   instructions.push(
-    getOpenPositionWithTokenExtensionsInstruction({
-      funder,
-      owner: funder.address,
-      position: positionAddress[0],
-      positionMint,
-      positionTokenAccount,
-      whirlpool: whirlpool.address,
-      associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ADDRESS,
-      tickLowerIndex: initializableLowerTickIndex,
-      tickUpperIndex: initializableUpperTickIndex,
-      token2022Program: TOKEN_2022_PROGRAM_ADDRESS,
-      metadataUpdateAuth: address(
-        "3axbTs2z5GBy6usVbNVoqEgZMng3vZvMnAoX29BFfwhr",
-      ),
-      withTokenMetadataExtension,
-    }),
+    getOpenPositionWithTokenExtensionsInstruction(
+      {
+        funder,
+        owner: funder.address,
+        position: positionAddress[0],
+        positionMint,
+        positionTokenAccount,
+        whirlpool: whirlpool.address,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ADDRESS,
+        tickLowerIndex: initializableLowerTickIndex,
+        tickUpperIndex: initializableUpperTickIndex,
+        token2022Program: TOKEN_2022_PROGRAM_ADDRESS,
+        metadataUpdateAuth: address(
+          "3axbTs2z5GBy6usVbNVoqEgZMng3vZvMnAoX29BFfwhr",
+        ),
+        withTokenMetadataExtension,
+      },
+      { programAddress: whirlpoolDeployment.programId },
+    ),
   );
 
   instructions.push(increaseLiquidityInstruction);
@@ -429,21 +477,28 @@ async function internalOpenPositionInstructions(
 }
 
 /**
+ * Options for {@link openPositionInstructions}, {@link openPositionInstructionsWithTickBounds} and {@link openFullRangePositionInstructions}.
+ */
+export type OpenPositionConfig = {
+  slippageToleranceBps?: number;
+  withTokenMetadataExtension?: boolean;
+  funder?: TransactionSigner<string>;
+  whirlpoolDeployment?: WhirlpoolDeployment;
+};
+
+/**
  * Opens a full-range position for a pool, typically used for Splash Pools or other full-range liquidity provisioning.
  *
  * @param {SolanaRpc} rpc - RPC client. Requires: GetAccountInfoApi, GetMultipleAccountsApi, GetMinimumBalanceForRentExemptionApi
  * @param {Address} poolAddress - The address of the liquidity pool.
  * @param {IncreaseLiquidityParam} param - Maximum amounts of token A and B to deposit.
- * @param {number} [slippageToleranceBps=SLIPPAGE_TOLERANCE_BPS] - The maximum acceptable slippage, in basis points (BPS).
- * @param {boolean} [withTokenMetadataExtension=true] - Whether to include the token metadata extension.
- * @param {TransactionSigner} [funder=FUNDER] - The account funding the transaction.
+ * @param {OpenPositionConfig} [config] - The parameters to build the open full range position instructions.
  * @returns {Promise<OpenPositionInstructions>} A promise that resolves to an object containing instructions, position mint address, and initialization cost.
  *
  * @example
- * import { openFullRangePositionInstructions, setWhirlpoolsConfig } from '@orca-so/whirlpools';
+ * import { openFullRangePositionInstructions, WhirlpoolDeployment } from '@orca-so/whirlpools';
  * import { generateKeyPairSigner, createSolanaRpc, devnet, address } from '@solana/kit';
  *
- * await setWhirlpoolsConfig('solanaDevnet');
  * const devnetRpc = createSolanaRpc(devnet('https://api.devnet.solana.com'));
  * const wallet = await generateKeyPairSigner(); // CAUTION: This wallet is not persistent.
  *
@@ -453,19 +508,27 @@ async function internalOpenPositionInstructions(
  *   devnetRpc,
  *   whirlpoolAddress,
  *   { tokenMaxA: 1_000_000n, tokenMaxB: 0n },
- *   100,
- *   true,
- *   wallet
+ *   {
+ *     slippageToleranceBps: 100,
+ *     withTokenMetadataExtension: true,
+ *     funder: wallet,
+ *     whirlpoolDeployment: WhirlpoolDeployment.devnet,
+ *   },
  * );
  */
 export async function openFullRangePositionInstructions(
   rpc: IncreaseLiquidityRpc,
   poolAddress: Address,
   param: IncreaseLiquidityParam,
-  slippageToleranceBps: number = SLIPPAGE_TOLERANCE_BPS,
-  withTokenMetadataExtension: boolean = true,
-  funder: TransactionSigner<string> = FUNDER,
+  config: OpenPositionConfig = {},
 ): Promise<OpenPositionInstructions> {
+  const slippageToleranceBps =
+    config.slippageToleranceBps ?? SLIPPAGE_TOLERANCE_BPS;
+  const withTokenMetadataExtension = config.withTokenMetadataExtension ?? true;
+  const funder = config.funder ?? FUNDER;
+  const whirlpoolDeployment =
+    config.whirlpoolDeployment ?? DEFAULT_WHIRLPOOL_DEPLOYMENT;
+
   const whirlpool = await fetchWhirlpool(rpc, poolAddress);
   const tickRange = getFullRangeTickIndexes(whirlpool.data.tickSpacing);
 
@@ -485,6 +548,7 @@ export async function openFullRangePositionInstructions(
     slippageToleranceBps,
     withTokenMetadataExtension,
     funder,
+    whirlpoolDeployment,
   );
 }
 
@@ -499,17 +563,14 @@ export async function openFullRangePositionInstructions(
  * @param {IncreaseLiquidityParam} param - Maximum amounts of token A and B to deposit.
  * @param {number} lowerPrice - The lower bound of the price range for the position.
  * @param {number} upperPrice - The upper bound of the price range for the position.
- * @param {number} [slippageToleranceBps=SLIPPAGE_TOLERANCE_BPS] - The slippage tolerance for adding liquidity, in basis points (BPS).
- * @param {boolean} [withTokenMetadataExtension=true] - Whether to include the token metadata extension.
- * @param {TransactionSigner} [funder=FUNDER] - The account funding the transaction.
+ * @param {OpenPositionConfig} [config] - The parameters to build the open position instruction.
  *
  * @returns {Promise<OpenPositionInstructions>} A promise that resolves to an object containing instructions, position mint address, and initialization cost.
  *
  * @example
- * import { openPositionInstructions, setWhirlpoolsConfig } from '@orca-so/whirlpools';
+ * import { openPositionInstructions, WhirlpoolDeployment } from '@orca-so/whirlpools';
  * import { generateKeyPairSigner, createSolanaRpc, devnet, address } from '@solana/kit';
  *
- * await setWhirlpoolsConfig('solanaDevnet');
  * const devnetRpc = createSolanaRpc(devnet('https://api.devnet.solana.com'));
  * const wallet = await generateKeyPairSigner(); // CAUTION: This wallet is not persistent.
  *
@@ -523,9 +584,12 @@ export async function openFullRangePositionInstructions(
  *   { tokenMaxA: 1_000_000n, tokenMaxB: 0n },
  *   lowerPrice,
  *   upperPrice,
- *   100,
- *   true,
- *   wallet
+ *   {
+ *     slippageToleranceBps: 100,
+ *     withTokenMetadataExtension: true,
+ *     funder: wallet,
+ *     whirlpoolDeployment: WhirlpoolDeployment.devnet,
+ *   },
  * );
  */
 export async function openPositionInstructions(
@@ -534,10 +598,15 @@ export async function openPositionInstructions(
   param: IncreaseLiquidityParam,
   lowerPrice: number,
   upperPrice: number,
-  slippageToleranceBps: number = SLIPPAGE_TOLERANCE_BPS,
-  withTokenMetadataExtension: boolean = true,
-  funder: TransactionSigner<string> = FUNDER,
+  config: OpenPositionConfig = {},
 ): Promise<OpenPositionInstructions> {
+  const slippageToleranceBps =
+    config.slippageToleranceBps ?? SLIPPAGE_TOLERANCE_BPS;
+  const withTokenMetadataExtension = config.withTokenMetadataExtension ?? true;
+  const funder = config.funder ?? FUNDER;
+  const whirlpoolDeployment =
+    config.whirlpoolDeployment ?? DEFAULT_WHIRLPOOL_DEPLOYMENT;
+
   const whirlpool = await fetchWhirlpool(rpc, poolAddress);
   assertWhirlpoolSupportsConcentratedPosition(whirlpool.data);
 
@@ -561,6 +630,7 @@ export async function openPositionInstructions(
     slippageToleranceBps,
     withTokenMetadataExtension,
     funder,
+    whirlpoolDeployment,
   );
 }
 
@@ -575,17 +645,14 @@ export async function openPositionInstructions(
  * @param {IncreaseLiquidityParam} param - Maximum amounts of token A and B to deposit.
  * @param {number} lowerTickIndex - The lower bound of the tick range for the position.
  * @param {number} upperTickIndex - The upper bound of the tick range for the position.
- * @param {number} [slippageToleranceBps=SLIPPAGE_TOLERANCE_BPS] - The slippage tolerance for adding liquidity, in basis points (BPS).
- * @param {boolean} [withTokenMetadataExtension=true] - Whether to include the token metadata extension.
- * @param {TransactionSigner} [funder=FUNDER] - The account funding the transaction.
+ * @param {OpenPositionConfig} [config] - The parameters to build the open position with tick bounds instruction.
  *
  * @returns {Promise<OpenPositionInstructions>} A promise that resolves to an object containing instructions, position mint address, and initialization cost.
  *
  * @example
- * import { openPositionInstructionsWithTickBounds, setWhirlpoolsConfig } from '@orca-so/whirlpools';
+ * import { openPositionInstructionsWithTickBounds, WhirlpoolDeployment } from '@orca-so/whirlpools';
  * import { generateKeyPairSigner, createSolanaRpc, devnet, address } from '@solana/kit';
  *
- * await setWhirlpoolsConfig('solanaDevnet');
  * const devnetRpc = createSolanaRpc(devnet('https://api.devnet.solana.com'));
  * const wallet = await generateKeyPairSigner(); // CAUTION: This wallet is not persistent.
  *
@@ -599,9 +666,12 @@ export async function openPositionInstructions(
  *   { tokenMaxA: 1_000_000n, tokenMaxB: 0n },
  *   lowerTickIndex,
  *   upperTickIndex,
- *   100,
- *   true,
- *   wallet
+ *   {
+ *     slippageToleranceBps: 100,
+ *     withTokenMetadataExtension: true,
+ *     funder: wallet,
+ *     whirlpoolDeployment: WhirlpoolDeployment.devnet,
+ *   },
  * );
  */
 export async function openPositionInstructionsWithTickBounds(
@@ -610,10 +680,15 @@ export async function openPositionInstructionsWithTickBounds(
   param: IncreaseLiquidityParam,
   lowerTickIndex: number,
   upperTickIndex: number,
-  slippageToleranceBps: number = SLIPPAGE_TOLERANCE_BPS,
-  withTokenMetadataExtension: boolean = true,
-  funder: TransactionSigner<string> = FUNDER,
+  config: OpenPositionConfig = {},
 ): Promise<OpenPositionInstructions> {
+  const slippageToleranceBps =
+    config.slippageToleranceBps ?? SLIPPAGE_TOLERANCE_BPS;
+  const withTokenMetadataExtension = config.withTokenMetadataExtension ?? true;
+  const funder = config.funder ?? FUNDER;
+  const whirlpoolDeployment =
+    config.whirlpoolDeployment ?? DEFAULT_WHIRLPOOL_DEPLOYMENT;
+
   const whirlpool = await fetchWhirlpool(rpc, poolAddress);
   assertWhirlpoolSupportsConcentratedPosition(whirlpool.data);
 
@@ -633,6 +708,7 @@ export async function openPositionInstructionsWithTickBounds(
     slippageToleranceBps,
     withTokenMetadataExtension,
     funder,
+    whirlpoolDeployment,
   );
 }
 
@@ -645,18 +721,60 @@ function assertWhirlpoolSupportsConcentratedPosition(whirlpool: Whirlpool) {
 
 // -------- ACTIONS --------
 
-export const increasePosLiquidity = wrapFunctionWithExecution(
-  increaseLiquidityInstructions,
-);
+export function increasePosLiquidity(
+  positionMintAddress: Address,
+  param: IncreaseLiquidityParam,
+  config?: IncreaseLiquidityConfig,
+) {
+  return executeWithCallback((rpc) =>
+    increaseLiquidityInstructions(rpc, positionMintAddress, param, config),
+  );
+}
 
-export const openFullRangePosition = wrapFunctionWithExecution(
-  openFullRangePositionInstructions,
-);
+export function openFullRangePosition(
+  poolAddress: Address,
+  param: IncreaseLiquidityParam,
+  config?: OpenPositionConfig,
+) {
+  return executeWithCallback((rpc) =>
+    openFullRangePositionInstructions(rpc, poolAddress, param, config),
+  );
+}
 
-export const openConcentratedPosition = wrapFunctionWithExecution(
-  openPositionInstructions,
-);
+export function openConcentratedPosition(
+  poolAddress: Address,
+  param: IncreaseLiquidityParam,
+  lowerPrice: number,
+  upperPrice: number,
+  config?: OpenPositionConfig,
+) {
+  return executeWithCallback((rpc) =>
+    openPositionInstructions(
+      rpc,
+      poolAddress,
+      param,
+      lowerPrice,
+      upperPrice,
+      config,
+    ),
+  );
+}
 
-export const openConcentratedPositionWithTickBounds = wrapFunctionWithExecution(
-  openPositionInstructionsWithTickBounds,
-);
+export function openConcentratedPositionWithTickBounds(
+  poolAddress: Address,
+  param: IncreaseLiquidityParam,
+  lowerTickIndex: number,
+  upperTickIndex: number,
+  config?: OpenPositionConfig,
+) {
+  return executeWithCallback((rpc) =>
+    openPositionInstructionsWithTickBounds(
+      rpc,
+      poolAddress,
+      param,
+      lowerTickIndex,
+      upperTickIndex,
+      config,
+    ),
+  );
+}

@@ -1,4 +1,6 @@
+import type { WhirlpoolDeployment } from "@orca-so/whirlpools-client";
 import {
+  DEFAULT_WHIRLPOOL_DEPLOYMENT,
   fetchPosition,
   fetchWhirlpool,
   getPositionAddress,
@@ -35,20 +37,27 @@ export type ResetPositionRangeInstructions = {
 export type ResetPositionRageInstructions = ResetPositionRangeInstructions;
 
 /**
+ * Options for {@link resetPositionRangeInstructions}.
+ */
+export type ResetPositionRangeConfig = {
+  authority?: TransactionSigner<string>;
+  whirlpoolDeployment?: WhirlpoolDeployment;
+};
+
+/**
  * Generates instructions to reset a position range.
  *
  * @param {SolanaRpc} rpc - The Solana RPC client.
  * @param {Address} positionMintAddress - The address of the position mint.
  * @param {number} newLowerPrice - The new lower price of the position.
  * @param {number} newUpperPrice - The new upper price of the position.
- * @param {TransactionSigner} [authority=FUNDER] - The account that authorizes the transaction. Defaults to a predefined funder.
+ * @param {ResetPositionRangeConfig} [config] - The parameters to build the reset position range instruction.
  * @returns {Promise<ResetPositionRangeInstructions>} A promise that resolves to an object containing instructions.
  *
  * @example
- * import { resetPositionRangeInstructions } from "@orca-so/whirlpools";
+ * import { resetPositionRangeInstructions, WhirlpoolDeployment } from "@orca-so/whirlpools";
  * import { createSolanaRpc, devnet } from "@solana/kit";
  *
- * await setWhirlpoolsConfig("solanaDevnet");
  * const devnetRpc = createSolanaRpc(devnet("https://api.devnet.solana.com"));
  * const wallet = await loadWallet();
  *
@@ -61,7 +70,10 @@ export type ResetPositionRageInstructions = ResetPositionRangeInstructions;
  *   positionMintAddress,
  *   newLowerPrice,
  *   newUpperPrice,
- *   wallet,
+ *   {
+ *      authority: wallet,
+ *      whirlpoolDeployment: WhirlpoolDeployment.devnet,
+ *   }
  * );
  */
 export async function resetPositionRangeInstructions(
@@ -69,8 +81,12 @@ export async function resetPositionRangeInstructions(
   positionMintAddress: Address,
   newLowerPrice: number,
   newUpperPrice: number,
-  authority: TransactionSigner<string> = FUNDER,
+  config: ResetPositionRangeConfig = {},
 ): Promise<ResetPositionRangeInstructions> {
+  const authority = config.authority ?? FUNDER;
+  const whirlpoolDeployment =
+    config.whirlpoolDeployment ?? DEFAULT_WHIRLPOOL_DEPLOYMENT;
+
   assert(
     authority.address !== DEFAULT_ADDRESS,
     "Either supply an authority or set the default funder",
@@ -78,7 +94,10 @@ export async function resetPositionRangeInstructions(
 
   const instructions: Instruction[] = [];
 
-  const positionAddress = await getPositionAddress(positionMintAddress);
+  const positionAddress = await getPositionAddress(
+    positionMintAddress,
+    whirlpoolDeployment.programId,
+  );
   const position = await fetchPosition(rpc, positionAddress[0]);
   const positionMint = await fetchMaybeMint(rpc, position.data.positionMint);
 
@@ -121,15 +140,18 @@ export async function resetPositionRangeInstructions(
   );
 
   instructions.push(
-    getResetPositionRangeInstruction({
-      funder: authority,
-      positionAuthority: authority,
-      position: position.address,
-      positionTokenAccount: positionTokenAccount[0],
-      newTickLowerIndex: newInitializableTickLowerIndex,
-      newTickUpperIndex: newInitializableTickUpperIndex,
-      whirlpool: position.data.whirlpool,
-    }),
+    getResetPositionRangeInstruction(
+      {
+        funder: authority,
+        positionAuthority: authority,
+        position: position.address,
+        positionTokenAccount: positionTokenAccount[0],
+        newTickLowerIndex: newInitializableTickLowerIndex,
+        newTickUpperIndex: newInitializableTickUpperIndex,
+        whirlpool: position.data.whirlpool,
+      },
+      { programAddress: whirlpoolDeployment.programId },
+    ),
   );
 
   return {
