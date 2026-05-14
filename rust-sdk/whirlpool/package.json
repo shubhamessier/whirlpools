@@ -1,6 +1,6 @@
 {
   "name": "@orca-so/whirlpools-rust",
-  "version": "7.0.2",
+  "version": "8.0.0",
   "scripts": {
     "build": "cargo build",
     "test": "cp ../../legacy-sdk/whirlpool/tests/external_program/token_2022.20250510.so ../../target/deploy/ && cp ../../legacy-sdk/whirlpool/tests/external_program/whirlpool_immutable.so ../../target/deploy/ && cargo test --lib",

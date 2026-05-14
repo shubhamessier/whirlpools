@@ -1,5 +1,15 @@
 # @orca-so/whirlpools-docs
 
+## 1.0.0
+
+### Major Changes
+
+- [#1306](https://github.com/orca-so/whirlpools/pull/1306) [`f6d9b9e`](https://github.com/orca-so/whirlpools/commit/f6d9b9e11690dca446082b94b943fcfe1b280a1a) Thanks [@crnorthc](https://github.com/crnorthc)! - Update the docs to reflect changes to the TypeScript and Rust SDKs made when updating extensibility for immutable whirlpools.
+
+### Patch Changes
+
+- [#1300](https://github.com/orca-so/whirlpools/pull/1300) [`b7b964c`](https://github.com/orca-so/whirlpools/commit/b7b964c29c0d3ba963e4e132662028f802089c04) Thanks [@yugure-orca](https://github.com/yugure-orca)! - Added new token extensions and v2 instructions
+
 ## 0.3.1
 
 ## 0.3.0

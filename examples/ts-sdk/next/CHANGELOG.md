@@ -1,5 +1,16 @@
 # @orca-so/whirlpools-example-ts-next
 
+## 1.0.0
+
+### Major Changes
+
+- [#1305](https://github.com/orca-so/whirlpools/pull/1305) [`9c2b830`](https://github.com/orca-so/whirlpools/commit/9c2b830d31f4910eb102a16f922c34e4c2bc6a3b) Thanks [@crnorthc](https://github.com/crnorthc)! - Replace the global `WHIRLPOOLS_CONFIG_ADDRESS` / `setWhirlpoolsConfig` / `DEFAULT_WHIRLPOOLS_CONFIG_ADDRESSES` API with a per-call `WhirlpoolDeployment` (mainnet / devnet / mainnet-immutable / custom). PDA helpers in `@orca-so/whirlpools-client` no longer take `whirlpoolsConfig` positionally — pass a `WhirlpoolDeployment` (or program id) instead, and SDK function arguments are bundled into `…Config` option objects.
+
+### Patch Changes
+
+- Updated dependencies [[`9c2b830`](https://github.com/orca-so/whirlpools/commit/9c2b830d31f4910eb102a16f922c34e4c2bc6a3b)]:
+  - @orca-so/whirlpools@8.0.0
+
 ## 0.2.0
 
 ### Minor Changes

@@ -1,5 +1,11 @@
 # @orca-so/whirlpools-example-rust-repositioning-bot
 
+## 1.0.0
+
+### Major Changes
+
+- [#1301](https://github.com/orca-so/whirlpools/pull/1301) [`eb85563`](https://github.com/orca-so/whirlpools/commit/eb8556393aaff00587729e1568effb74f7448a15) Thanks [@crnorthc](https://github.com/crnorthc)! - Replace the global `WHIRLPOOLS_CONFIG_ADDRESS` / `set_whirlpools_config_address` / `WhirlpoolsConfigInput` API with a per-call `WhirlpoolDeployment` (mainnet / devnet / mainnet-immutable / custom), and move SDK function arguments into `…Config` structs.
+
 ## 0.4.1
 
 ### Patch Changes

@@ -1,6 +1,6 @@
 {
   "name": "@orca-so/whirlpools-example-rust-repositioning-bot",
-  "version": "0.4.1",
+  "version": "1.0.0",
   "private": true,
   "scripts": {
     "build": "cargo build",
